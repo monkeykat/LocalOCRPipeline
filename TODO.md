@@ -23,18 +23,19 @@ Implement in order. The target is a fully local Dockerized Python POC on the HP 
 
 ## 3. Build the extraction layer
 
-- [ ] Implement `app/extractor.py` using Docling as the document-processing layer for PDF parsing, document structure, page identification, native text extraction, and coordination with OCR where appropriate; avoid building a custom PDF parser.
-- [ ] Attempt normal Docling text extraction to determine whether the document has usable text throughout. Use native extraction only for text-based documents; if any of the document is scanned/image-based or otherwise lacks usable text, use PaddleOCR for the document. Keep this a document-level decision rather than adding page-by-page classification.
-- [ ] Implement the OCR path: render PDF pages as images, recognize text with PaddleOCR, and retain each page's original page number.
-- [ ] Format both extraction paths consistently as plain text, with `=== PAGE n ===` separators for every original page (including pages with no recognized text) and page boundaries/numbering preserved.
-- [ ] Handle PDFs that mix usable text and scanned/image-based content according to the document-level decision: run OCR for the document rather than returning incomplete native-only text.
-- [ ] Support PDFs embedded in PDFs (including embedded PDF attachments): discover and extract each one, then process it through the same registration, hashing, extraction, output, and error-tracking flow without silently omitting it; retain parent/source context and ensure embedded files with identical names do not overwrite one another.
-- [ ] Return the extracted text, page count, and extraction method (`native` or `ocr`) to the caller; surface extraction failures for status/error handling.
+- [x] Implement `app/extractor.py` using Docling as the document-processing layer for PDF parsing, document structure, page identification, native text extraction, and coordination with OCR where appropriate; avoid building a custom PDF parser.
+- [x] Attempt normal Docling text extraction to determine whether the document has usable text throughout. Use native extraction only for text-based documents; if any of the document is scanned/image-based or otherwise lacks usable text, use PaddleOCR for the document. Keep this a document-level decision rather than adding page-by-page classification.
+- [x] Implement the OCR path: render PDF pages as images, recognize text with PaddleOCR, and retain each page's original page number.
+- [x] Format both extraction paths consistently as plain text, with `=== PAGE n ===` separators for every original page (including pages with no recognized text) and page boundaries/numbering preserved.
+- [x] Handle PDFs that mix usable text and scanned/image-based content according to the document-level decision: run OCR for the document rather than returning incomplete native-only text.
+- [x] Discover and extract embedded PDF attachments with pypdf; return their bytes, attachment index, filename, and parent context for registration and processing by the processor.
+- [x] Return the extracted text, page count, and extraction method (`native` or `ocr`) to the caller; surface conversion, rendering, and OCR errors for status/error handling.
 
 ## 4. Implement per-document processing
 
 - [ ] Implement `app/processor.py` to register each PDF with filename, path, file hash, and processing status; populate its page count as soon as parsing makes it available.
 - [ ] Calculate a content hash and use it to avoid reprocessing documents already marked `COMPLETE`.
+- [ ] Recursively register and process every embedded PDF returned by the extractor, retaining parent/attachment context and ensuring duplicate embedded filenames cannot overwrite outputs.
 - [ ] Populate `page_count` after parsing and before successful completion; ensure failed or interrupted work is not recorded as complete.
 - [ ] Transition each document through the appropriate statuses, recording extraction method, completion time, and page count on success.
 - [ ] Mark a document `COMPLETE` only after its completed `.txt` output has been published successfully.

@@ -48,6 +48,12 @@ The compose service mounts `data/` and `models/` from the project directory so
 outputs, failure records, SQLite status, and model caches persist across
 container runs.
 
+The extractor uses Docling's native PDF pipeline to parse text and render
+page images without running Docling OCR. It uses PaddleOCR for documents
+without usable native text and pypdf to discover embedded PDF attachments.
+The attachment extraction support is pinned through `pypdf` in
+`requirements.txt`.
+
 ## Runtime assumptions and validation
 
 - Python 3.11 on Debian Bookworm; the image builds for the host's native
