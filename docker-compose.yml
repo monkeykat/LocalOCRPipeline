@@ -1,0 +1,28 @@
+services:
+  extractor:
+    build: .
+    init: true
+    working_dir: /app
+    command: ["python", "-m", "app.main"]
+    environment:
+      DOCLING_ARTIFACTS_PATH: /models/.cache/docling/models
+      HF_HOME: /models/.cache/huggingface
+      HF_HUB_OFFLINE: "1"
+      HOME: /models
+      TRANSFORMERS_OFFLINE: "1"
+    network_mode: none
+    volumes:
+      - ./data:/app/data
+      - ./models:/models
+
+  prepare-models:
+    build: .
+    profiles: ["model-setup"]
+    working_dir: /app
+    command: ["python", "scripts/prepare_models.py"]
+    environment:
+      DOCLING_ARTIFACTS_PATH: /models/.cache/docling/models
+      HF_HOME: /models/.cache/huggingface
+      HOME: /models
+    volumes:
+      - ./models:/models
