@@ -135,6 +135,39 @@ class PdfExtractorTests(unittest.TestCase):
             "=== PAGE 1 ===\n\nOCR page one\n\n=== PAGE 2 ===\n\n",
         )
 
+    def test_page_with_embedded_image_uses_document_level_ocr(self) -> None:
+        pages = {
+            1: make_page(1, SimpleNamespace(pil_image=lambda: FakeImage())),
+            2: make_page(2, SimpleNamespace(pil_image=lambda: FakeImage())),
+        }
+        picture = SimpleNamespace(
+            label="picture",
+            prov=[SimpleNamespace(page_no=2)],
+        )
+        document = make_document(
+            pages,
+            [
+                (make_text_item("Native page one", 1), 0),
+                (make_text_item("Native text on mixed page two", 2), 0),
+                (picture, 0),
+            ],
+        )
+        ocr = FakeOCRReader(
+            [
+                [(object(), ("OCR page one", 0.99))],
+                [(object(), ("OCR mixed page two", 0.99))],
+            ]
+        )
+
+        result = PdfExtractor(
+            converter=FakeConverter(document),
+            ocr_reader=ocr,
+        ).extract(Path("/input/mixed.pdf"))
+
+        self.assertEqual(result.extraction_method, ExtractionMethod.OCR)
+        self.assertEqual(len(ocr.images), 2)
+        self.assertIn("OCR mixed page two", result.text)
+
     def test_table_content_is_exported_to_markdown(self) -> None:
         table = SimpleNamespace(
             label="table",

@@ -181,3 +181,14 @@ def has_completed_hash(connection: sqlite3.Connection, file_hash: str) -> bool:
         (file_hash,),
     ).fetchone()
     return bool(row[0])
+
+
+def reset_interrupted_documents(connection: sqlite3.Connection) -> int:
+    cursor = connection.execute(
+        """
+        UPDATE documents
+        SET status = 'PENDING', completed_at = NULL
+        WHERE status = 'PROCESSING'
+        """
+    )
+    return cursor.rowcount

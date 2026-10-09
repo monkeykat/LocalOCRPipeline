@@ -33,7 +33,13 @@ and performance on the target device before processing the full dataset.
 
 ## Run
 
-Place PDFs in `data/input/`, then run:
+Place PDFs in `data/input/`, then run the architecture's CLI:
+
+```sh
+python -m app.main
+```
+
+Or run the same CLI in the isolated Docker runtime:
 
 ```sh
 docker compose run --rm extractor
@@ -53,6 +59,44 @@ page images without running Docling OCR. It uses PaddleOCR for documents
 without usable native text and pypdf to discover embedded PDF attachments.
 The attachment extraction support is pinned through `pypdf` in
 `requirements.txt`.
+
+Successful documents are written as page-preserved `.txt` files with a
+neighboring `.json` metadata file under the matching `data/output/` path.
+Failures are tracked in SQLite and the source PDF is copied under
+`data/failed/`; input PDFs are left untouched. Embedded PDFs are processed
+recursively and get attachment-indexed output paths beneath a directory named
+for their parent PDF. Completed content hashes are reused rather than
+re-extracted, and records left `PROCESSING` after an interruption are retried
+when the processor starts.
+
+The CLI recursively scans nested input folders, prints per-document progress
+and a batch summary, continues after a failed PDF, and exits with a non-zero
+status if one or more documents fail.
+
+## Development validation corpus
+
+Generate a synthetic 183-page corpus covering native text, scans, multi-column
+pages, tables, forms, poor-quality scans, engineering diagrams, mixed
+text/image pages, embedded PDFs, duplicates, nested directories, and an
+unreadable PDF:
+
+```sh
+python -m pip install -r requirements-test.txt
+python -m scripts.generate_test_dataset
+```
+
+The PDFs are written under `tests/fixtures/pdf_dataset/`; the generator can
+also write to a different directory with `--output`. Run the unit suite with:
+
+```sh
+python -m unittest discover -s tests
+```
+
+The current development host can run the corpus generator and mocked
+unit/integration tests, but it does not have Docling or PaddleOCR installed.
+Consequently, live native extraction, OCR quality/performance, Docker offline
+operation, and HP ZGX Nano behavior remain unverified until tested on the
+target runtime and device.
 
 ## Runtime assumptions and validation
 

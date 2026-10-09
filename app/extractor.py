@@ -77,7 +77,10 @@ class PdfExtractor:
             )
 
         native_pages = self._extract_native_pages(document, page_items)
-        if all(page_text.strip() for page_text in native_pages.values()):
+        if (
+            all(page_text.strip() for page_text in native_pages.values())
+            and not self._has_embedded_images(document)
+        ):
             page_texts = native_pages
             method = ExtractionMethod.NATIVE
         else:
@@ -190,6 +193,14 @@ class PdfExtractor:
             page_number: "\n".join(items)
             for page_number, items in page_text.items()
         }
+
+    @staticmethod
+    def _has_embedded_images(document: Any) -> bool:
+        for item, _ in document.iterate_items():
+            label = getattr(item, "label", None)
+            if getattr(label, "value", label) == "picture":
+                return True
+        return False
 
     def _extract_ocr_pages(
         self,

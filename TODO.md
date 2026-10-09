@@ -33,31 +33,31 @@ Implement in order. The target is a fully local Dockerized Python POC on the HP 
 
 ## 4. Implement per-document processing
 
-- [ ] Implement `app/processor.py` to register each PDF with filename, path, file hash, and processing status; populate its page count as soon as parsing makes it available.
-- [ ] Calculate a content hash and use it to avoid reprocessing documents already marked `COMPLETE`.
-- [ ] Recursively register and process every embedded PDF returned by the extractor, retaining parent/attachment context and ensuring duplicate embedded filenames cannot overwrite outputs.
-- [ ] Populate `page_count` after parsing and before successful completion; ensure failed or interrupted work is not recorded as complete.
-- [ ] Transition each document through the appropriate statuses, recording extraction method, completion time, and page count on success.
-- [ ] Mark a document `COMPLETE` only after its completed `.txt` output has been published successfully.
-- [ ] Write a plain-text `.txt` output for each successful PDF at the matching path under `data/output/` (for example, `maintenance_manual.pdf` → `maintenance_manual.txt`), including `DOCUMENT: <filename>` and the page-preserved extracted text.
-- [ ] Write outputs through a temporary file and publish them only when complete, so interruption cannot leave a partial file that appears successful.
-- [ ] Mirror the input directory structure under `data/output/` and `data/failed/` so files with the same name in different input folders do not collide.
-- [ ] Optionally write a neighboring `.json` metadata file with filename, file hash, page count, extraction method, and status.
-- [ ] On a document failure, record its error, mark it `FAILED`, place or identify the failed source in `data/failed/`, and leave processing able to continue with the next document.
-- [ ] Ensure an interrupted or failed attempt can be retried cleanly without treating partial output as a successful result.
-- [ ] On startup, identify documents left in `PROCESSING` by an interrupted run and return them to a retryable state without marking them complete.
+- [x] Implement `app/processor.py` to register each PDF with filename, path, file hash, and processing status; populate its page count as soon as parsing makes it available.
+- [x] Calculate a content hash and use it to avoid reprocessing documents already marked `COMPLETE`; reuse a completed extraction when a duplicate PDF needs its own output path.
+- [x] Recursively register and process every embedded PDF returned by the extractor, retaining parent/attachment context and ensuring duplicate embedded filenames cannot overwrite outputs.
+- [x] Populate `page_count` after parsing and before successful completion; ensure failed or interrupted work is not recorded as complete.
+- [x] Transition each document through the appropriate statuses, recording extraction method, completion time, and page count on success.
+- [x] Mark a document `COMPLETE` only after its completed `.txt` output has been published successfully.
+- [x] Write a plain-text `.txt` output for each successful PDF at the matching path under `data/output/` (for example, `maintenance_manual.pdf` → `maintenance_manual.txt`), including `DOCUMENT: <filename>` and the page-preserved extracted text.
+- [x] Write outputs through temporary files and publish them only when complete, so interruption cannot leave a partial file that appears successful.
+- [x] Mirror the input directory structure under `data/output/` and `data/failed/` so files with the same name in different input folders do not collide.
+- [x] Write a neighboring `.json` metadata file with filename, file hash, page count, extraction method, and status.
+- [x] On a document failure, record its error, mark it `FAILED`, copy the failed source to `data/failed/`, and leave processing able to continue with the next document.
+- [x] Ensure an interrupted or failed attempt can be retried cleanly without treating partial output as a successful result.
+- [x] On startup, identify documents left in `PROCESSING` by an interrupted run and return them to a retryable state without marking them complete.
 
 ## 5. Add scanning and command-line execution
 
-- [ ] Implement `app/main.py` so `python -m app.main` scans `data/input/` for PDFs, including PDFs in nested directories.
-- [ ] Process every PDF not already successfully processed, including newly discovered embedded PDFs, while skipping successfully completed hashes.
-- [ ] Print the application heading and a run summary with PDFs found, completed document count, total pages, native and OCR page totals, and failed count; print per-document filename, page count, extraction method, and clear failure reasons.
-- [ ] Ensure a bad or unreadable PDF does not terminate the batch.
+- [x] Implement `app/main.py` so `python -m app.main` scans `data/input/` recursively for PDFs.
+- [x] Process every PDF not already successfully processed, including newly discovered embedded PDFs, while skipping/reusing successfully completed hashes.
+- [x] Print the application heading and a run summary with PDFs found, completed document count, total pages, native and OCR page totals, and failed count; print per-document filename, page count, extraction method, and clear failure reasons.
+- [x] Ensure a bad or unreadable PDF does not terminate the batch; report a non-zero process exit when any PDF failed.
 
 ## 6. Validate against a representative dataset
 
-- [ ] Assemble a local test set totaling approximately 100–500 pages: native-text PDFs, scans, multi-column pages, tables, forms, poor-quality scans, engineering documents, and mixed text/image PDFs.
-- [ ] Include cases for embedded PDFs, duplicate file contents, nested input folders, unreadable PDFs, and interruption/restart.
+- [x] Assemble a local synthetic test set totaling approximately 100–500 pages: native-text PDFs, scans, multi-column pages, tables, forms, poor-quality scans, engineering documents, and mixed text/image PDFs.
+- [x] Include cases for embedded PDFs, duplicate file contents, nested input folders, unreadable PDFs, and interruption/restart.
 - [ ] Verify native PDFs use native extraction and scanned/no-usable-text PDFs use OCR.
 - [ ] Inspect output text for usability, correct page separators and numbering, metadata accuracy, directory mirroring, and preservation of the original PDFs.
 - [ ] Verify database status transitions, error records, duplicate skipping, retry behavior, and continued batch processing after a failure.
