@@ -1,5 +1,7 @@
-docling==2.135.0
+docling-slim[format-pdf]==2.135.0
 numpy==1.26.4
 paddleocr==2.10.0
 paddlepaddle==2.6.2
+pyclipper==1.3.0.post6
 pypdf==5.9.0
+rtree==1.4.1

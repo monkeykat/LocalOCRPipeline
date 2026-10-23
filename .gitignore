@@ -22,3 +22,4 @@ __pycache__/
 .coverage
 coverage.xml
 .DS_Store
+documents.sqlite3

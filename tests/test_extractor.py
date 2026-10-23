@@ -68,7 +68,11 @@ def make_document(
 
 
 def make_page(page_number: int, image: object | None = None) -> SimpleNamespace:
-    return SimpleNamespace(page_no=page_number, image=image)
+    return SimpleNamespace(
+        page_no=page_number,
+        image=image,
+        size=SimpleNamespace(width=612, height=792),
+    )
 
 
 def make_text_item(text: str, page_number: int) -> SimpleNamespace:
@@ -135,6 +139,22 @@ class PdfExtractorTests(unittest.TestCase):
             "=== PAGE 1 ===\n\nOCR page one\n\n=== PAGE 2 ===\n\n",
         )
 
+    def test_ocr_accepts_docling_pil_image_property(self) -> None:
+        document = make_document(
+            {1: make_page(1, SimpleNamespace(pil_image=FakeImage()))},
+            [],
+        )
+        ocr = FakeOCRReader([[(object(), ("OCR page", 0.99))]])
+
+        result = PdfExtractor(
+            converter=FakeConverter(document),
+            ocr_reader=ocr,
+        ).extract(Path("/input/scanned.pdf"))
+
+        self.assertEqual(result.extraction_method, ExtractionMethod.OCR)
+        self.assertEqual(len(ocr.images), 1)
+        self.assertIn("OCR page", result.text)
+
     def test_page_with_embedded_image_uses_document_level_ocr(self) -> None:
         pages = {
             1: make_page(1, SimpleNamespace(pil_image=lambda: FakeImage())),
@@ -142,7 +162,12 @@ class PdfExtractorTests(unittest.TestCase):
         }
         picture = SimpleNamespace(
             label="picture",
-            prov=[SimpleNamespace(page_no=2)],
+            prov=[
+                SimpleNamespace(
+                    page_no=2,
+                    bbox=SimpleNamespace(l=72, t=520, r=538, b=240),
+                )
+            ],
         )
         document = make_document(
             pages,
@@ -167,6 +192,31 @@ class PdfExtractorTests(unittest.TestCase):
         self.assertEqual(result.extraction_method, ExtractionMethod.OCR)
         self.assertEqual(len(ocr.images), 2)
         self.assertIn("OCR mixed page two", result.text)
+
+    def test_small_decorative_image_keeps_native_extraction(self) -> None:
+        picture = SimpleNamespace(
+            label="picture",
+            prov=[
+                SimpleNamespace(
+                    page_no=1,
+                    bbox=SimpleNamespace(l=72, t=714, r=148, b=638),
+                )
+            ],
+        )
+        document = make_document(
+            {1: make_page(1)},
+            [(make_text_item("Readable page text", 1), 0), (picture, 0)],
+        )
+        ocr = FakeOCRReader([[(object(), ("bad OCR", 0.5))]])
+
+        result = PdfExtractor(
+            converter=FakeConverter(document),
+            ocr_reader=ocr,
+        ).extract(Path("/input/decorative-logo.pdf"))
+
+        self.assertEqual(result.extraction_method, ExtractionMethod.NATIVE)
+        self.assertIn("Readable page text", result.text)
+        self.assertEqual(ocr.images, [])
 
     def test_table_content_is_exported_to_markdown(self) -> None:
         table = SimpleNamespace(

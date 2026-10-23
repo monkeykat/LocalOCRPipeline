@@ -9,6 +9,10 @@ import numpy as np
 
 from app.database import ExtractionMethod
 
+# Ignore small logos and seals; larger pictures may contain text missing from
+# the PDF text layer, so they trigger the document-level OCR path.
+_MIN_IMAGE_AREA_RATIO_FOR_OCR = 0.05
+
 
 class ExtractionError(RuntimeError):
     """Raised when a PDF cannot be converted into page-preserved text."""
@@ -79,7 +83,7 @@ class PdfExtractor:
         native_pages = self._extract_native_pages(document, page_items)
         if (
             all(page_text.strip() for page_text in native_pages.values())
-            and not self._has_embedded_images(document)
+            and not self._has_significant_embedded_images(document, page_items)
         ):
             page_texts = native_pages
             method = ExtractionMethod.NATIVE
@@ -195,11 +199,36 @@ class PdfExtractor:
         }
 
     @staticmethod
-    def _has_embedded_images(document: Any) -> bool:
+    def _has_significant_embedded_images(
+        document: Any,
+        pages: dict[int, Any],
+    ) -> bool:
         for item, _ in document.iterate_items():
             label = getattr(item, "label", None)
-            if getattr(label, "value", label) == "picture":
+            if getattr(label, "value", label) != "picture":
+                continue
+
+            provenance = getattr(item, "prov", ())
+            if not provenance:
                 return True
+
+            for source in provenance:
+                page = pages.get(int(source.page_no))
+                page_size = getattr(page, "size", None)
+                bbox = getattr(source, "bbox", None)
+                if page_size is None or bbox is None:
+                    return True
+
+                try:
+                    page_area = float(page_size.width) * float(page_size.height)
+                    image_width = abs(float(bbox.r) - float(bbox.l))
+                    image_height = abs(float(bbox.t) - float(bbox.b))
+                except (AttributeError, TypeError, ValueError):
+                    return True
+                if page_area <= 0:
+                    return True
+                if image_width * image_height / page_area >= _MIN_IMAGE_AREA_RATIO_FOR_OCR:
+                    return True
         return False
 
     def _extract_ocr_pages(
@@ -211,8 +240,8 @@ class PdfExtractor:
         result: dict[int, str] = {}
         for page_number, page in pages.items():
             page_image = getattr(page, "image", None)
-            image_factory = getattr(page_image, "pil_image", None)
-            image = image_factory() if callable(image_factory) else None
+            pil_image = getattr(page_image, "pil_image", None)
+            image = pil_image() if callable(pil_image) else pil_image
             if image is None:
                 raise ExtractionError(
                     f"Docling did not provide a rendered image for page {page_number} "
@@ -227,6 +256,9 @@ class PdfExtractor:
     def _get_ocr_reader(self) -> OCRReader:
         if self._ocr_reader is None:
             try:
+                # PaddlePaddle 2.6 loads a bundled zlib symbol that can break
+                # later imports of SciPy's native modules on ARM64.
+                import scipy  # noqa: F401
                 from paddleocr import PaddleOCR
             except ImportError as error:
                 raise ExtractionError(

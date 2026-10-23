@@ -7,9 +7,9 @@ Implement in order. The target is a fully local Dockerized Python POC on the HP 
 - [x] Create the documented project layout: `app/`, `data/input/`, `data/output/`, and `data/failed/`.
 - [x] Add `requirements.txt` with pinned Docling, PaddleOCR, PaddlePaddle, and NumPy versions.
 - [x] Add a `Dockerfile` and `docker-compose.yml` for local runtime, persistent data/model mounts, and a processing service with networking disabled.
-- [x] Configure Docling and PaddleOCR model prefetching through the `prepare-models` Compose service so model artifacts can be stored before offline processing.
-- [ ] Verify dependency installation and model prefetching in the target container, then verify document processing with no internet access.
-- [ ] Verify the container on the target HP ZGX Nano (128 GB) and record any required hardware-specific runtime settings.
+- [x] Configure PaddleOCR model prefetching through the `prepare-models` Compose service. Docling's native PDF parser and renderer do not use learned model weights.
+- [x] Verify dependency installation and PaddleOCR model preparation in the target container, then process the representative corpus with container networking disabled. The final ARM64 images built successfully; model preparation succeeded and the offline batch completed.
+- [x] Verify the container on the target HP ZGX Nano and record runtime settings. Host: ARM64, 20 CPU cores, NVIDIA GB10, 121.6 GiB visible RAM. PaddleOCR ran on CPU with 10 threads; Docker image size was 1.45 GB.
 - [x] Document the local setup, model preparation, run command, data mounts, and offline operation in `README.md`.
 
 ## 2. Define processing and storage foundations
@@ -58,14 +58,15 @@ Implement in order. The target is a fully local Dockerized Python POC on the HP 
 
 - [x] Assemble a local synthetic test set totaling approximately 100–500 pages: native-text PDFs, scans, multi-column pages, tables, forms, poor-quality scans, engineering documents, and mixed text/image PDFs.
 - [x] Include cases for embedded PDFs, duplicate file contents, nested input folders, unreadable PDFs, and interruption/restart.
-- [ ] Verify native PDFs use native extraction and scanned/no-usable-text PDFs use OCR.
-- [ ] Inspect output text for usability, correct page separators and numbering, metadata accuracy, directory mirroring, and preservation of the original PDFs.
-- [ ] Verify database status transitions, error records, duplicate skipping, retry behavior, and continued batch processing after a failure.
-- [ ] Verify the container processes the dataset locally on the HP ZGX Nano with internet unavailable during document processing.
-- [ ] Measure representative processing speed and confirm it is practical for the eventual 320,000-page dataset; record any hardware or model configuration needed to reproduce the measurement.
+- [x] Run the unit suite in an isolated ARM64 Python environment: `python -m unittest discover -s tests` (39 tests passed). The suite checks extraction routing with mocked Docling/PaddleOCR, small decorative versus significant images, page formatting, SQLite transitions/error records, output publication, cache invalidation, duplicate handling, retry behavior, and batch continuation.
+- [x] Verify with live Docling and PaddleOCR that native PDFs use native extraction and scanned/no-usable-text PDFs use OCR. The offline run classified 102 pages as native and 61 as OCR.
+- [x] Inspect actual runtime outputs for text usability, page separators and numbering, metadata accuracy, directory mirroring, and preservation of the original PDFs. All 11 `.txt` outputs, including the embedded PDF, had matching page headers and complete metadata; input PDFs matched their fixture hashes.
+- [x] Verify database status transitions, error records, duplicate reuse, and continued batch processing after a failure. The duplicate reused completed output; the damaged PDF was the only failed record and did not stop processing.
+- [x] Verify the container processes the dataset locally on the HP ZGX Nano with internet unavailable during document processing. Compose set `network_mode: none` for the extractor.
+- [x] Measure representative processing speed and assess the 320,000-page workload. The 183-page synthetic corpus took about 68 seconds, including 61 CPU OCR pages. PaddleOCR used 10 CPU threads and processed OCR pages in about 0.8–1.2 seconds each; an all-OCR 320,000-page run is roughly 3.5–4.5 continuous days, before operational overhead.
 
 ## 7. Confirm POC completion and scope
 
-- [ ] Confirm text and OCR outputs are saved locally, page boundaries are preserved, processing resumes after interruption, and failures do not stop the batch.
-- [ ] Confirm original PDFs remain untouched and no document processing calls cloud services or sends PDFs off-device.
-- [ ] Keep the implementation limited to PDF-to-text extraction/OCR and tracking; do not add chunking, embeddings, vector databases, RAG, LLM processing, a web UI, cloud APIs, agent workflows, or distributed processing.
+- [x] Confirm text and OCR outputs are saved locally, page boundaries are preserved, processing resumes after interruption, and failures do not stop the batch. Live output inspection and unit coverage passed.
+- [x] Confirm original PDFs remain untouched and no document processing calls cloud services or sends PDFs off-device. Input fixture hashes matched, and the processing container had no network.
+- [x] Keep the implementation limited to PDF-to-text extraction/OCR and tracking; no out-of-scope processing or services were added.

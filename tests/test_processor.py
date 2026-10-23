@@ -80,6 +80,7 @@ class DocumentProcessorTests(unittest.TestCase):
         self.assertEqual(metadata["filename"], "engine.pdf")
         self.assertEqual(metadata["page_count"], 2)
         self.assertEqual(metadata["status"], "complete")
+        self.assertEqual(metadata["pipeline_version"], 2)
         self.assertEqual(self.database_rows()[0]["status"], "COMPLETE")
         self.assertEqual(source.read_bytes(), b"%PDF-1.7 source")
 
@@ -113,6 +114,24 @@ class DocumentProcessorTests(unittest.TestCase):
         self.assertEqual(self.extractor.calls, ["missing-output.pdf"] * 2)
         self.assertTrue((self.paths.output_dir / "missing-output.txt").is_file())
 
+    def test_old_pipeline_output_is_reprocessed(self) -> None:
+        source = self.create_pdf("old-pipeline.pdf", b"%PDF-old-output")
+        self.processor.process_document(source)
+        metadata_path = self.paths.output_dir / "old-pipeline.json"
+        metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        metadata.pop("pipeline_version")
+        metadata_path.write_text(json.dumps(metadata), encoding="utf-8")
+
+        result = self.processor.process_document(source)
+
+        self.assertEqual(result.status, DocumentStatus.COMPLETE)
+        self.assertFalse(result.skipped)
+        self.assertEqual(self.extractor.calls, ["old-pipeline.pdf"] * 2)
+        self.assertEqual(
+            json.loads(metadata_path.read_text(encoding="utf-8"))["pipeline_version"],
+            2,
+        )
+
     def test_failure_records_error_and_copies_source_without_stopping(self) -> None:
         first = self.create_pdf("damaged.pdf", b"%PDF-damaged")
         second = self.create_pdf("good.pdf", b"%PDF-good")
@@ -132,6 +151,22 @@ class DocumentProcessorTests(unittest.TestCase):
                 (self.database_rows()[0]["id"],),
             ).fetchone()
         self.assertIn("cannot read damaged.pdf", error_row["error"])
+
+    def test_successful_retry_removes_stale_failed_copy(self) -> None:
+        source = self.create_pdf("retry.pdf", b"%PDF-retry")
+        failed_path = self.paths.failed_dir / "retry.pdf"
+        self.extractor.fail_names.add("retry.pdf")
+
+        first_attempt = self.processor.process_document(source)
+        self.assertEqual(first_attempt.status, DocumentStatus.FAILED)
+        self.assertTrue(failed_path.is_file())
+
+        self.extractor.fail_names.clear()
+        retry = self.processor.process_document(source)
+
+        self.assertEqual(retry.status, DocumentStatus.COMPLETE)
+        self.assertFalse(failed_path.exists())
+        self.assertEqual(self.database_rows()[0]["status"], "COMPLETE")
 
     def test_output_write_failure_never_leaves_a_success_shaped_result(self) -> None:
         source = self.create_pdf("write-fails.pdf", b"%PDF-write-fails")

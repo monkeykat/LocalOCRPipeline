@@ -32,6 +32,8 @@ from app.paths import (
     output_path_for,
 )
 
+_EXTRACTION_PIPELINE_VERSION = 2
+
 
 class Extractor(Protocol):
     def extract(
@@ -172,6 +174,7 @@ class DocumentProcessor:
                             page_count=page_count,
                             extraction_method=extraction_method,
                         )
+                    self._remove_failed_copy(failed_path)
                 except Exception as error:
                     self._remove_output_artifacts(output_relative_path)
                     message = f"{type(error).__name__}: {error}"
@@ -221,6 +224,7 @@ class DocumentProcessor:
                     page_count=extraction.page_count,
                     extraction_method=extraction.extraction_method,
                 )
+            self._remove_failed_copy(failed_path)
         except Exception as error:
             self._remove_output_artifacts(output_relative_path)
             message = f"{type(error).__name__}: {error}"
@@ -305,6 +309,7 @@ class DocumentProcessor:
         metadata: dict[str, object] = {
             "filename": filename,
             "file_hash": file_hash,
+            "pipeline_version": _EXTRACTION_PIPELINE_VERSION,
             "page_count": extraction.page_count,
             "extraction_method": extraction.extraction_method.value,
             "status": DocumentStatus.COMPLETE.value.lower(),
@@ -335,6 +340,8 @@ class DocumentProcessor:
                 continue
             if not isinstance(metadata, dict) or metadata.get("file_hash") != file_hash:
                 continue
+            if metadata.get("pipeline_version") != _EXTRACTION_PIPELINE_VERSION:
+                continue
             text_path = metadata_path.with_suffix(".txt")
             if not text_path.is_file():
                 continue
@@ -364,6 +371,7 @@ class DocumentProcessor:
         metadata: dict[str, object] = {
             "filename": filename,
             "file_hash": file_hash,
+            "pipeline_version": _EXTRACTION_PIPELINE_VERSION,
             "page_count": cached_metadata["page_count"],
             "extraction_method": cached_metadata["extraction_method"],
             "status": DocumentStatus.COMPLETE.value.lower(),
@@ -386,6 +394,15 @@ class DocumentProcessor:
         output_path = self._output_path(output_relative_path)
         output_path.unlink(missing_ok=True)
         output_path.with_suffix(".json").unlink(missing_ok=True)
+
+    @staticmethod
+    def _remove_failed_copy(failed_path: Path) -> None:
+        try:
+            failed_path.unlink(missing_ok=True)
+        except OSError:
+            # Failure copies are secondary artifacts; don't invalidate a
+            # document that has already been published and marked complete.
+            pass
 
     def _fail_document(
         self,

@@ -2,9 +2,7 @@ FROM python:3.11-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
-    HOME=/models \
-    HF_HOME=/models/.cache/huggingface \
-    DOCLING_ARTIFACTS_PATH=/models/.cache/docling/models
+    HOME=/models
 
 WORKDIR /app
 
