@@ -32,7 +32,7 @@ from app.paths import (
     output_path_for,
 )
 
-_EXTRACTION_PIPELINE_VERSION = 4
+_EXTRACTION_PIPELINE_VERSION = 6
 
 
 class Extractor(Protocol):
@@ -321,6 +321,50 @@ class DocumentProcessor:
                 str(page_number): round(confidence, 4)
                 for page_number, confidence in extraction.ocr_confidence
             }
+        if extraction.ocr_lines:
+            metadata["ocr_lines_by_page"] = {
+                str(page_number): [
+                    {
+                        "text": line.text,
+                        **(
+                            {"confidence": round(line.confidence, 4)}
+                            if line.confidence is not None
+                            else {}
+                        ),
+                        **(
+                            {
+                                "polygon_normalized": [
+                                    [round(x, 6), round(y, 6)]
+                                    for x, y in line.polygon
+                                ]
+                            }
+                            if line.polygon is not None
+                            else {}
+                        ),
+                    }
+                    for line in lines
+                ]
+                for page_number, lines in extraction.ocr_lines
+            }
+        if extraction.native_regions:
+            metadata["native_text_regions_by_page"] = {
+                str(page_number): [
+                    {
+                        "text": region.text,
+                        **(
+                            {
+                                "bbox_normalized": [
+                                    round(value, 6) for value in region.bbox
+                                ]
+                            }
+                            if region.bbox is not None
+                            else {}
+                        ),
+                    }
+                    for region in regions
+                ]
+                for page_number, regions in extraction.native_regions
+            }
         if parent_context is not None:
             metadata["parent"] = parent_context
 
@@ -383,6 +427,14 @@ class DocumentProcessor:
             "extraction_method": cached_metadata["extraction_method"],
             "status": DocumentStatus.COMPLETE.value.lower(),
         }
+        for key in (
+            "ocr_pages",
+            "ocr_confidence_by_page",
+            "ocr_lines_by_page",
+            "native_text_regions_by_page",
+        ):
+            if key in cached_metadata:
+                metadata[key] = cached_metadata[key]
         if parent_context is not None:
             metadata["parent"] = parent_context
 

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from difflib import SequenceMatcher
 from io import BytesIO
+from math import isfinite
 from pathlib import Path, PurePath
 from typing import Any, Protocol
 
@@ -12,7 +14,6 @@ from app.database import ExtractionMethod
 
 # Four pixels per PDF point is about 288 dpi, close to a common 300 dpi scan.
 _OCR_IMAGE_SCALE = 4.0
-_IMAGE_DOMINANT_PAGE_RATIO = 0.25
 _WORD_PATTERN = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)?")
 _SUSPICIOUS_WORD_PATTERN = re.compile(
     r"[A-Za-z][~`#$%&+<>;|][A-Za-z]|([A-Za-z])\1\1|"
@@ -33,6 +34,19 @@ class EmbeddedPDF:
 
 
 @dataclass(frozen=True)
+class OCRLine:
+    text: str
+    confidence: float | None
+    polygon: tuple[tuple[float, float], ...] | None
+
+
+@dataclass(frozen=True)
+class NativeTextRegion:
+    text: str
+    bbox: tuple[float, float, float, float] | None
+
+
+@dataclass(frozen=True)
 class PDFExtraction:
     text: str
     page_count: int
@@ -40,6 +54,8 @@ class PDFExtraction:
     embedded_pdfs: tuple[EmbeddedPDF, ...]
     ocr_pages: tuple[int, ...] = ()
     ocr_confidence: tuple[tuple[int, float], ...] = ()
+    ocr_lines: tuple[tuple[int, tuple[OCRLine, ...]], ...] = ()
+    native_regions: tuple[tuple[int, tuple[NativeTextRegion, ...]], ...] = ()
 
 
 class OCRReader(Protocol):
@@ -88,13 +104,12 @@ class PdfExtractor:
                 f"the PDF has {expected_page_count} pages"
             )
 
-        native_pages = self._extract_native_pages(document, page_items)
-        embedded_pdfs, image_pages = self._extract_pdf_resources(source, source_name)
-        docling_image_pages, image_dominant_pages = self._get_docling_image_pages(
+        native_pages, native_regions = self._extract_native_pages(
             document,
             page_items,
         )
-        image_pages.update(docling_image_pages)
+        embedded_pdfs, image_pages = self._extract_pdf_resources(source, source_name)
+        image_pages.update(self._get_docling_image_pages(document, page_items))
         pages_to_ocr = {
             page_number
             for page_number, page_text in native_pages.items()
@@ -112,25 +127,24 @@ class PdfExtractor:
 
         page_texts: dict[int, str] = {}
         for page_number, native_text in native_pages.items():
-            recognized_text = ocr_pages.get(page_number)
-            if not recognized_text:
+            recognized_lines = ocr_pages.get(page_number, ())
+            if not recognized_lines:
                 page_texts[page_number] = native_text
-            elif (
-                page_number in image_pages
-                and page_number not in image_dominant_pages
-                and native_text.strip()
-                and not self._native_text_is_suspicious(native_text)
-            ):
-                additional_ocr_text = self._ocr_lines_missing_from_native(
-                    native_text,
-                    recognized_text,
-                )
-                page_texts[page_number] = self._join_text(
-                    native_text,
-                    additional_ocr_text,
-                )
+            elif not native_text.strip():
+                page_texts[page_number] = self._format_ocr_lines(recognized_lines)
             else:
-                page_texts[page_number] = recognized_text
+                supplemental_lines = self._uncovered_ocr_lines(
+                    recognized_lines,
+                    native_text,
+                    native_regions.get(page_number, ()),
+                )
+                if supplemental_lines:
+                    page_texts[page_number] = self._join_text(
+                        native_text,
+                        self._format_ocr_supplement(supplemental_lines),
+                    )
+                else:
+                    page_texts[page_number] = native_text
 
         method = (
             ExtractionMethod.OCR if pages_to_ocr else ExtractionMethod.NATIVE
@@ -142,6 +156,11 @@ class PdfExtractor:
             embedded_pdfs=embedded_pdfs,
             ocr_pages=tuple(sorted(ocr_pages)),
             ocr_confidence=tuple(sorted(ocr_confidence.items())),
+            ocr_lines=tuple(sorted(ocr_pages.items())),
+            native_regions=tuple(
+                (page_number, tuple(regions))
+                for page_number, regions in sorted(native_regions.items())
+            ),
         )
 
     def _get_converter(self) -> PDFConverter:
@@ -222,8 +241,14 @@ class PdfExtractor:
         )
 
     @staticmethod
-    def _extract_native_pages(document: Any, pages: dict[int, Any]) -> dict[int, str]:
+    def _extract_native_pages(
+        document: Any,
+        pages: dict[int, Any],
+    ) -> tuple[dict[int, str], dict[int, list[NativeTextRegion]]]:
         page_text: dict[int, list[str]] = {page_number: [] for page_number in pages}
+        page_regions: dict[int, list[NativeTextRegion]] = {
+            page_number: [] for page_number in pages
+        }
         for item, _ in document.iterate_items():
             provenance = getattr(item, "prov", ())
             text = getattr(item, "text", None)
@@ -236,21 +261,84 @@ class PdfExtractor:
             for source in provenance:
                 page_number = int(source.page_no)
                 if page_number in page_text and text.strip():
-                    page_text[page_number].append(text.strip())
+                    item_text = text.strip()
+                    page_text[page_number].append(item_text)
+                    page_regions[page_number].append(
+                        NativeTextRegion(
+                            text=item_text,
+                            bbox=PdfExtractor._normalized_native_bbox(
+                                getattr(source, "bbox", None),
+                                pages[page_number],
+                            ),
+                        )
+                    )
 
-        return {
-            page_number: "\n".join(items)
-            for page_number, items in page_text.items()
-        }
+        return (
+            {
+                page_number: "\n".join(items)
+                for page_number, items in page_text.items()
+            },
+            page_regions,
+        )
+
+    @staticmethod
+    def _normalized_native_bbox(
+        bbox: Any,
+        page: Any,
+    ) -> tuple[float, float, float, float] | None:
+        if bbox is None:
+            return None
+        page_size = getattr(page, "size", None)
+        try:
+            page_width = float(page_size.width)
+            page_height = float(page_size.height)
+            left_value = float(bbox.l)
+            right_value = float(bbox.r)
+            top_value = float(bbox.t)
+            bottom_value = float(bbox.b)
+        except (AttributeError, TypeError, ValueError, ZeroDivisionError):
+            return None
+        if (
+            page_width <= 0
+            or page_height <= 0
+            or not all(
+                isfinite(value)
+                for value in (
+                    page_width,
+                    page_height,
+                    left_value,
+                    right_value,
+                    top_value,
+                    bottom_value,
+                )
+            )
+        ):
+            return None
+
+        left = left_value / page_width
+        right = right_value / page_width
+
+        origin = getattr(bbox, "coord_origin", "TOPLEFT")
+        origin = str(getattr(origin, "value", origin)).upper()
+        if origin == "BOTTOMLEFT":
+            top = (page_height - top_value) / page_height
+            bottom = (page_height - bottom_value) / page_height
+        else:
+            top = top_value / page_height
+            bottom = bottom_value / page_height
+
+        left, right = sorted((max(0.0, min(1.0, left)), max(0.0, min(1.0, right))))
+        top, bottom = sorted((max(0.0, min(1.0, top)), max(0.0, min(1.0, bottom))))
+        if right <= left or bottom <= top:
+            return None
+        return left, top, right, bottom
 
     @staticmethod
     def _get_docling_image_pages(
         document: Any,
         pages: dict[int, Any],
-    ) -> tuple[set[int], set[int]]:
+    ) -> set[int]:
         image_pages: set[int] = set()
-        image_rectangles: dict[int, list[tuple[float, float, float, float]]] = {}
-        image_dominant_pages: set[int] = set()
         for item, _ in document.iterate_items():
             label = getattr(item, "label", None)
             if getattr(label, "value", label) != "picture":
@@ -258,44 +346,12 @@ class PdfExtractor:
 
             provenance = getattr(item, "prov", ())
             if not provenance:
-                return set(pages), set(pages)
+                return set(pages)
             for source in provenance:
                 page_number = int(source.page_no)
                 if page_number in pages:
                     image_pages.add(page_number)
-                    bbox = getattr(source, "bbox", None)
-                    page_size = getattr(pages[page_number], "size", None)
-                    try:
-                        page_width = float(page_size.width)
-                        page_height = float(page_size.height)
-                        left = max(0.0, float(bbox.l))
-                        right = min(page_width, float(bbox.r))
-                        bottom = max(0.0, float(bbox.b))
-                        top = min(page_height, float(bbox.t))
-                    except (AttributeError, TypeError, ValueError):
-                        image_dominant_pages.add(page_number)
-                        continue
-                    if (
-                        page_width <= 0
-                        or page_height <= 0
-                        or right <= left
-                        or top <= bottom
-                    ):
-                        image_dominant_pages.add(page_number)
-                        continue
-                    image_rectangles.setdefault(page_number, []).append(
-                        (left, bottom, right, top)
-                    )
-
-        for page_number, rectangles in image_rectangles.items():
-            page_size = pages[page_number].size
-            page_area = float(page_size.width) * float(page_size.height)
-            if page_area > 0 and (
-                _rectangle_union_area(rectangles) / page_area
-                >= _IMAGE_DOMINANT_PAGE_RATIO
-            ):
-                image_dominant_pages.add(page_number)
-        return image_pages, image_dominant_pages
+        return image_pages
 
     @staticmethod
     def _native_text_is_suspicious(text: str) -> bool:
@@ -318,40 +374,73 @@ class PdfExtractor:
         return suspicious_words >= 2 or suspicious_characters >= 2
 
     @staticmethod
-    def _ocr_lines_missing_from_native(native_text: str, ocr_text: str) -> str:
-        native_tokens = [
+    def _uncovered_ocr_lines(
+        ocr_lines: tuple[OCRLine, ...],
+        native_text: str,
+        native_regions: list[NativeTextRegion] | tuple[NativeTextRegion, ...],
+    ) -> tuple[OCRLine, ...]:
+        reference_tokens = [
             token.casefold() for token in _WORD_PATTERN.findall(native_text)
         ]
-        native_compact = "".join(
+        reference_compact = "".join(
             character.casefold()
             for character in native_text
             if character.isalnum()
         )
-        additional_lines: list[str] = []
-        for line in ocr_text.splitlines():
-            line = line.strip()
-            if not line:
-                continue
-            line_tokens = [token.casefold() for token in _WORD_PATTERN.findall(line)]
+        uncovered: list[OCRLine] = []
+        for line in ocr_lines:
+            line_tokens = [
+                token.casefold() for token in _WORD_PATTERN.findall(line.text)
+            ]
             compact_line = "".join(
                 character.casefold()
-                for character in line
+                for character in line.text
                 if character.isalnum()
             )
             if not compact_line:
                 continue
-            if compact_line in native_compact or _contains_token_sequence(
-                native_tokens,
-                line_tokens,
-            ):
+            line_bbox = _polygon_bbox(line.polygon)
+            if line_bbox is not None:
+                if any(
+                    region.bbox is not None
+                    and _intersection_over_self(line_bbox, region.bbox) >= 0.5
+                    and _similar_text_in_region(line_tokens, region.text)
+                    for region in native_regions
+                ):
+                    continue
+            elif (
+                len(compact_line) >= 8
+                and compact_line in reference_compact
+            ) or _contains_token_sequence(reference_tokens, line_tokens):
                 continue
-            additional_lines.append(line)
-        if not additional_lines:
-            return ""
-        return (
-            "[OCR text not present in the PDF text layer]\n"
-            + "\n".join(additional_lines)
+            uncovered.append(line)
+        return tuple(uncovered)
+
+    @staticmethod
+    def _format_ocr_lines(lines: tuple[OCRLine, ...]) -> str:
+        return "\n".join(
+            ["[OCR line positions are normalized to page size]"]
+            + [PdfExtractor._format_ocr_line(line) for line in lines]
         )
+
+    @staticmethod
+    def _format_ocr_supplement(lines: tuple[OCRLine, ...]) -> str:
+        formatted = [
+            "[OCR text not represented in the PDF text layer; positions are "
+            "normalized to page size]"
+        ]
+        formatted.extend(PdfExtractor._format_ocr_line(line) for line in lines)
+        return "\n".join(formatted)
+
+    @staticmethod
+    def _format_ocr_line(line: OCRLine) -> str:
+        bbox = _polygon_bbox(line.polygon)
+        if bbox is None:
+            location = "[position unavailable]"
+        else:
+            left, top, right, bottom = bbox
+            location = f"[x={left:.3f}..{right:.3f}, y={top:.3f}..{bottom:.3f}]"
+        return f"{location} {line.text}"
 
     @staticmethod
     def _join_text(first: str, second: str) -> str:
@@ -365,11 +454,11 @@ class PdfExtractor:
         self,
         pages: dict[int, Any],
         filename: str,
-    ) -> tuple[dict[int, str], dict[int, float]]:
+    ) -> tuple[dict[int, tuple[OCRLine, ...]], dict[int, float]]:
         if not pages:
             return {}, {}
         reader = self._get_ocr_reader()
-        result: dict[int, str] = {}
+        result: dict[int, tuple[OCRLine, ...]] = {}
         confidence: dict[int, float] = {}
         for page_number, page in pages.items():
             page_image = getattr(page, "image", None)
@@ -380,11 +469,14 @@ class PdfExtractor:
                     f"Docling did not provide a rendered image for page {page_number} "
                     f"of {filename}"
                 )
-            text, page_confidence = self._recognized_text(
-                reader.ocr(np.asarray(image.convert("RGB")), cls=True),
+            image = image.convert("RGB")
+            lines, page_confidence = self._recognized_text(
+                reader.ocr(np.asarray(image), cls=True),
                 page_number,
+                image.width,
+                image.height,
             )
-            result[page_number] = text
+            result[page_number] = lines
             if page_confidence is not None:
                 confidence[page_number] = page_confidence
         return result, confidence
@@ -407,15 +499,17 @@ class PdfExtractor:
     def _recognized_text(
         raw_result: Any,
         page_number: int,
-    ) -> tuple[str, float | None]:
+        image_width: int,
+        image_height: int,
+    ) -> tuple[tuple[OCRLine, ...], float | None]:
         if not isinstance(raw_result, list):
             raise ExtractionError(
                 f"PaddleOCR returned an invalid result for page {page_number}"
             )
         if not raw_result or raw_result[0] is None:
-            return "", None
+            return (), None
 
-        lines: list[str] = []
+        lines: list[OCRLine] = []
         confidence_scores: list[float] = []
         for line in raw_result[0]:
             try:
@@ -429,17 +523,29 @@ class PdfExtractor:
                     f"PaddleOCR returned non-text content for page {page_number}"
                 )
             if recognized_text.strip():
-                lines.append(recognized_text.strip())
+                line_confidence: float | None = None
                 try:
-                    confidence_scores.append(float(line[1][1]))
+                    line_confidence = float(line[1][1])
+                    confidence_scores.append(line_confidence)
                 except (IndexError, TypeError, ValueError):
                     pass
+                lines.append(
+                    OCRLine(
+                        text=recognized_text.strip(),
+                        confidence=line_confidence,
+                        polygon=_normalized_ocr_polygon(
+                            line[0] if isinstance(line, (list, tuple)) else None,
+                            image_width,
+                            image_height,
+                        ),
+                    )
+                )
         mean_confidence = (
             sum(confidence_scores) / len(confidence_scores)
             if confidence_scores
             else None
         )
-        return "\n".join(lines), mean_confidence
+        return tuple(lines), mean_confidence
 
     @staticmethod
     def _format_pages(pages: dict[int, str]) -> str:
@@ -496,6 +602,58 @@ class PdfExtractor:
         return tuple(embedded), image_pages
 
 
+def _normalized_ocr_polygon(
+    raw_polygon: Any,
+    image_width: int,
+    image_height: int,
+) -> tuple[tuple[float, float], ...] | None:
+    if raw_polygon is None or image_width <= 0 or image_height <= 0:
+        return None
+    try:
+        points = tuple(
+            (
+                max(0.0, min(1.0, float(point[0]) / image_width)),
+                max(0.0, min(1.0, float(point[1]) / image_height)),
+            )
+            for point in raw_polygon
+        )
+    except (IndexError, TypeError, ValueError):
+        return None
+    return (
+        points
+        if len(points) >= 3
+        and all(isfinite(value) for point in points for value in point)
+        else None
+    )
+
+
+def _polygon_bbox(
+    polygon: tuple[tuple[float, float], ...] | None,
+) -> tuple[float, float, float, float] | None:
+    if not polygon:
+        return None
+    x_values = [point[0] for point in polygon]
+    y_values = [point[1] for point in polygon]
+    left, right = min(x_values), max(x_values)
+    top, bottom = min(y_values), max(y_values)
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _intersection_over_self(
+    first: tuple[float, float, float, float],
+    second: tuple[float, float, float, float],
+) -> float:
+    left = max(first[0], second[0])
+    top = max(first[1], second[1])
+    right = min(first[2], second[2])
+    bottom = min(first[3], second[3])
+    intersection = max(0.0, right - left) * max(0.0, bottom - top)
+    first_area = max(0.0, first[2] - first[0]) * max(0.0, first[3] - first[1])
+    return intersection / first_area if first_area else 0.0
+
+
 def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
     if not needle or len(needle) > len(haystack):
         return False
@@ -506,38 +664,29 @@ def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
     )
 
 
-def _rectangle_union_area(
-    rectangles: list[tuple[float, float, float, float]],
-) -> float:
-    """Return the union area of page-coordinate rectangles."""
-    x_coordinates = sorted(
-        {
-            coordinate
-            for left, _, right, _ in rectangles
-            for coordinate in (left, right)
-        }
-    )
-    area = 0.0
-    for left, right in zip(x_coordinates, x_coordinates[1:]):
-        if right <= left:
-            continue
-        intervals = sorted(
-            (bottom, top)
-            for rect_left, bottom, rect_right, top in rectangles
-            if rect_left < right and rect_right > left
-        )
-        covered_height = 0.0
-        if intervals:
-            interval_start, interval_end = intervals[0]
-            for start, end in intervals[1:]:
-                if start <= interval_end:
-                    interval_end = max(interval_end, end)
-                else:
-                    covered_height += interval_end - interval_start
-                    interval_start, interval_end = start, end
-            covered_height += interval_end - interval_start
-        area += (right - left) * covered_height
-    return area
+def _similar_text_in_region(needle: list[str], region_text: str) -> bool:
+    """Check whether a nearby native text region likely contains this OCR line."""
+    if not needle:
+        return False
+    haystack = [token.casefold() for token in _WORD_PATTERN.findall(region_text)]
+    if _contains_token_sequence(haystack, needle):
+        return True
+    if len("".join(needle)) < 6:
+        return False
+    needle_text = " ".join(needle)
+    min_window = max(1, len(needle) - 1)
+    max_window = min(len(haystack), len(needle) + 1)
+    for window_size in range(min_window, max_window + 1):
+        for start in range(len(haystack) - window_size + 1):
+            candidate = haystack[start : start + window_size]
+            similarity = SequenceMatcher(
+                None,
+                needle_text,
+                " ".join(candidate),
+            ).ratio()
+            if similarity >= 0.82:
+                return True
+    return False
 
 
 def _is_pdf_attachment(name: str, content: bytes) -> bool:

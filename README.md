@@ -60,11 +60,14 @@ The extractor uses Docling's native PDF pipeline to parse text and render
 page images, and PaddleOCR to read rendered pages. Every page containing an
 embedded image is OCR'd regardless of image size or count; this also catches
 scans stored as many small image strips. Pages with missing or visibly
-suspicious native text are OCR'd as well. Image-dominant pages use OCR text as
-their primary output; on mixed pages, readable native text is retained and
-OCR lines absent from the PDF text layer are added. The output metadata records
-OCR'd page numbers and mean PaddleOCR confidence by page when available. pypdf
-also discovers embedded PDF attachments.
+suspicious native text are OCR'd as well. Readable PDF text is retained even
+when images cover most of a page; OCR lines not already represented in the
+text layer are added under the correct page with their normalized page
+coordinates. OCR lines, confidence, and polygons, along with native text
+regions and bounding boxes, are recorded under their page numbers in the JSON
+metadata. Coordinates use a top-left origin and range from 0 to 1. The output
+metadata also records OCR'd page numbers and mean PaddleOCR confidence by page
+when available. pypdf discovers embedded PDF attachments.
 The attachment extraction support is pinned through `pypdf` in
 `requirements.txt`.
 
