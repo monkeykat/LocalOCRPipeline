@@ -32,7 +32,7 @@ from app.paths import (
     output_path_for,
 )
 
-_EXTRACTION_PIPELINE_VERSION = 3
+_EXTRACTION_PIPELINE_VERSION = 4
 
 
 class Extractor(Protocol):

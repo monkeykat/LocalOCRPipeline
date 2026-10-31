@@ -130,6 +130,7 @@ older extraction rules are regenerated automatically.
   publishes a Python 3.11 Linux ARM64 wheel. The built image is about 1.45 GB.
 - The validated host is ARM64 with 20 CPU cores, an NVIDIA GB10, and 121.6 GiB
   visible RAM. PaddleOCR ran on CPU; the Compose service does not request GPU
-  access. Docling renders at 2x scale for OCR input.
+  access. Docling renders at 4 pixels per PDF point (about 288 dpi) for OCR
+  input.
 - Compose runs containers as the host UID/GID (default `1000:1000`) so output
   files stay accessible to the local account.

@@ -12,8 +12,6 @@ from app.database import ExtractionMethod
 
 # Four pixels per PDF point is about 288 dpi, close to a common 300 dpi scan.
 _OCR_IMAGE_SCALE = 4.0
-# This estimate only chooses OCR as the primary text for raster-heavy pages.
-# The presence of even one image always schedules page OCR.
 _IMAGE_DOMINANT_PAGE_RATIO = 0.25
 _WORD_PATTERN = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)?")
 _SUSPICIOUS_WORD_PATTERN = re.compile(
@@ -91,12 +89,12 @@ class PdfExtractor:
             )
 
         native_pages = self._extract_native_pages(document, page_items)
-        (
-            embedded_pdfs,
-            image_pages,
-            image_dominant_pages,
-        ) = self._extract_pdf_resources(source, source_name)
-        image_pages.update(self._get_docling_image_pages(document, page_items))
+        embedded_pdfs, image_pages = self._extract_pdf_resources(source, source_name)
+        docling_image_pages, image_dominant_pages = self._get_docling_image_pages(
+            document,
+            page_items,
+        )
+        image_pages.update(docling_image_pages)
         pages_to_ocr = {
             page_number
             for page_number, page_text in native_pages.items()
@@ -249,8 +247,10 @@ class PdfExtractor:
     def _get_docling_image_pages(
         document: Any,
         pages: dict[int, Any],
-    ) -> set[int]:
+    ) -> tuple[set[int], set[int]]:
         image_pages: set[int] = set()
+        image_rectangles: dict[int, list[tuple[float, float, float, float]]] = {}
+        image_dominant_pages: set[int] = set()
         for item, _ in document.iterate_items():
             label = getattr(item, "label", None)
             if getattr(label, "value", label) != "picture":
@@ -258,12 +258,44 @@ class PdfExtractor:
 
             provenance = getattr(item, "prov", ())
             if not provenance:
-                return set(pages)
+                return set(pages), set(pages)
             for source in provenance:
                 page_number = int(source.page_no)
                 if page_number in pages:
                     image_pages.add(page_number)
-        return image_pages
+                    bbox = getattr(source, "bbox", None)
+                    page_size = getattr(pages[page_number], "size", None)
+                    try:
+                        page_width = float(page_size.width)
+                        page_height = float(page_size.height)
+                        left = max(0.0, float(bbox.l))
+                        right = min(page_width, float(bbox.r))
+                        bottom = max(0.0, float(bbox.b))
+                        top = min(page_height, float(bbox.t))
+                    except (AttributeError, TypeError, ValueError):
+                        image_dominant_pages.add(page_number)
+                        continue
+                    if (
+                        page_width <= 0
+                        or page_height <= 0
+                        or right <= left
+                        or top <= bottom
+                    ):
+                        image_dominant_pages.add(page_number)
+                        continue
+                    image_rectangles.setdefault(page_number, []).append(
+                        (left, bottom, right, top)
+                    )
+
+        for page_number, rectangles in image_rectangles.items():
+            page_size = pages[page_number].size
+            page_area = float(page_size.width) * float(page_size.height)
+            if page_area > 0 and (
+                _rectangle_union_area(rectangles) / page_area
+                >= _IMAGE_DOMINANT_PAGE_RATIO
+            ):
+                image_dominant_pages.add(page_number)
+        return image_pages, image_dominant_pages
 
     @staticmethod
     def _native_text_is_suspicious(text: str) -> bool:
@@ -420,7 +452,7 @@ class PdfExtractor:
     def _extract_pdf_resources(
         source: Path | bytes,
         parent_filename: str,
-    ) -> tuple[tuple[EmbeddedPDF, ...], set[int], set[int]]:
+    ) -> tuple[tuple[EmbeddedPDF, ...], set[int]]:
         try:
             from pypdf import PdfReader
         except ImportError as error:
@@ -436,30 +468,15 @@ class PdfExtractor:
 
         reader = PdfReader(reader_source)
         image_pages: set[int] = set()
-        image_dominant_pages: set[int] = set()
         for page_number, page in enumerate(getattr(reader, "pages", ()), start=1):
             try:
                 images = page.images
                 if images:
                     image_pages.add(page_number)
-                    page_area = (
-                        float(page.mediabox.width)
-                        * float(page.mediabox.height)
-                    )
-                    image_area = sum(
-                        float(image.image.width) * float(image.image.height)
-                        for image in images
-                    )
-                    if (
-                        page_area > 0
-                        and image_area / page_area >= _IMAGE_DOMINANT_PAGE_RATIO
-                    ):
-                        image_dominant_pages.add(page_number)
             except Exception:
                 # An image the PDF reader cannot enumerate must not be silently
                 # skipped. OCR the rendered page as a conservative fallback.
                 image_pages.add(page_number)
-                image_dominant_pages.add(page_number)
 
         embedded: list[EmbeddedPDF] = []
         attachment_index = 0
@@ -476,7 +493,7 @@ class PdfExtractor:
                         attachment_index=attachment_index,
                     )
                 )
-        return tuple(embedded), image_pages, image_dominant_pages
+        return tuple(embedded), image_pages
 
 
 def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
@@ -487,6 +504,40 @@ def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
         haystack[index : index + needle_length] == needle
         for index in range(len(haystack) - needle_length + 1)
     )
+
+
+def _rectangle_union_area(
+    rectangles: list[tuple[float, float, float, float]],
+) -> float:
+    """Return the union area of page-coordinate rectangles."""
+    x_coordinates = sorted(
+        {
+            coordinate
+            for left, _, right, _ in rectangles
+            for coordinate in (left, right)
+        }
+    )
+    area = 0.0
+    for left, right in zip(x_coordinates, x_coordinates[1:]):
+        if right <= left:
+            continue
+        intervals = sorted(
+            (bottom, top)
+            for rect_left, bottom, rect_right, top in rectangles
+            if rect_left < right and rect_right > left
+        )
+        covered_height = 0.0
+        if intervals:
+            interval_start, interval_end = intervals[0]
+            for start, end in intervals[1:]:
+                if start <= interval_end:
+                    interval_end = max(interval_end, end)
+                else:
+                    covered_height += interval_end - interval_start
+                    interval_start, interval_end = start, end
+            covered_height += interval_end - interval_start
+        area += (right - left) * covered_height
+    return area
 
 
 def _is_pdf_attachment(name: str, content: bytes) -> bool:
