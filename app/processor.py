@@ -32,7 +32,7 @@ from app.paths import (
     output_path_for,
 )
 
-_EXTRACTION_PIPELINE_VERSION = 2
+_EXTRACTION_PIPELINE_VERSION = 3
 
 
 class Extractor(Protocol):
@@ -314,6 +314,13 @@ class DocumentProcessor:
             "extraction_method": extraction.extraction_method.value,
             "status": DocumentStatus.COMPLETE.value.lower(),
         }
+        if extraction.ocr_pages:
+            metadata["ocr_pages"] = list(extraction.ocr_pages)
+        if extraction.ocr_confidence:
+            metadata["ocr_confidence_by_page"] = {
+                str(page_number): round(confidence, 4)
+                for page_number, confidence in extraction.ocr_confidence
+            }
         if parent_context is not None:
             metadata["parent"] = parent_context
 

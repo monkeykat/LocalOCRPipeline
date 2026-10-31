@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path, PurePath
@@ -9,9 +10,16 @@ import numpy as np
 
 from app.database import ExtractionMethod
 
-# Ignore small logos and seals; larger pictures may contain text missing from
-# the PDF text layer, so they trigger the document-level OCR path.
-_MIN_IMAGE_AREA_RATIO_FOR_OCR = 0.05
+# Four pixels per PDF point is about 288 dpi, close to a common 300 dpi scan.
+_OCR_IMAGE_SCALE = 4.0
+# This estimate only chooses OCR as the primary text for raster-heavy pages.
+# The presence of even one image always schedules page OCR.
+_IMAGE_DOMINANT_PAGE_RATIO = 0.25
+_WORD_PATTERN = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)?")
+_SUSPICIOUS_WORD_PATTERN = re.compile(
+    r"[A-Za-z][~`#$%&+<>;|][A-Za-z]|([A-Za-z])\1\1|"
+    r"[A-Z][a-z]+[A-Z][a-z]"
+)
 
 
 class ExtractionError(RuntimeError):
@@ -32,6 +40,8 @@ class PDFExtraction:
     page_count: int
     extraction_method: ExtractionMethod
     embedded_pdfs: tuple[EmbeddedPDF, ...]
+    ocr_pages: tuple[int, ...] = ()
+    ocr_confidence: tuple[tuple[int, float], ...] = ()
 
 
 class OCRReader(Protocol):
@@ -48,7 +58,7 @@ class PdfExtractor:
         converter: PDFConverter | None = None,
         ocr_reader: OCRReader | None = None,
         *,
-        image_scale: float = 2.0,
+        image_scale: float = _OCR_IMAGE_SCALE,
     ) -> None:
         if image_scale <= 0:
             raise ValueError("image_scale must be greater than zero")
@@ -81,22 +91,59 @@ class PdfExtractor:
             )
 
         native_pages = self._extract_native_pages(document, page_items)
-        if (
-            all(page_text.strip() for page_text in native_pages.values())
-            and not self._has_significant_embedded_images(document, page_items)
-        ):
-            page_texts = native_pages
-            method = ExtractionMethod.NATIVE
-        else:
-            page_texts = self._extract_ocr_pages(page_items, source_name)
-            method = ExtractionMethod.OCR
+        (
+            embedded_pdfs,
+            image_pages,
+            image_dominant_pages,
+        ) = self._extract_pdf_resources(source, source_name)
+        image_pages.update(self._get_docling_image_pages(document, page_items))
+        pages_to_ocr = {
+            page_number
+            for page_number, page_text in native_pages.items()
+            if self._native_text_is_suspicious(page_text)
+        }
+        pages_to_ocr.update(image_pages)
+        pages_for_ocr = {
+            page_number: page_items[page_number]
+            for page_number in sorted(pages_to_ocr)
+        }
+        ocr_pages, ocr_confidence = self._extract_ocr_pages(
+            pages_for_ocr,
+            source_name,
+        )
 
-        embedded_pdfs = self._extract_embedded_pdfs(source, source_name)
+        page_texts: dict[int, str] = {}
+        for page_number, native_text in native_pages.items():
+            recognized_text = ocr_pages.get(page_number)
+            if not recognized_text:
+                page_texts[page_number] = native_text
+            elif (
+                page_number in image_pages
+                and page_number not in image_dominant_pages
+                and native_text.strip()
+                and not self._native_text_is_suspicious(native_text)
+            ):
+                additional_ocr_text = self._ocr_lines_missing_from_native(
+                    native_text,
+                    recognized_text,
+                )
+                page_texts[page_number] = self._join_text(
+                    native_text,
+                    additional_ocr_text,
+                )
+            else:
+                page_texts[page_number] = recognized_text
+
+        method = (
+            ExtractionMethod.OCR if pages_to_ocr else ExtractionMethod.NATIVE
+        )
         return PDFExtraction(
             text=self._format_pages(page_texts),
             page_count=page_count,
             extraction_method=method,
             embedded_pdfs=embedded_pdfs,
+            ocr_pages=tuple(sorted(ocr_pages)),
+            ocr_confidence=tuple(sorted(ocr_confidence.items())),
         )
 
     def _get_converter(self) -> PDFConverter:
@@ -199,10 +246,11 @@ class PdfExtractor:
         }
 
     @staticmethod
-    def _has_significant_embedded_images(
+    def _get_docling_image_pages(
         document: Any,
         pages: dict[int, Any],
-    ) -> bool:
+    ) -> set[int]:
+        image_pages: set[int] = set()
         for item, _ in document.iterate_items():
             label = getattr(item, "label", None)
             if getattr(label, "value", label) != "picture":
@@ -210,34 +258,87 @@ class PdfExtractor:
 
             provenance = getattr(item, "prov", ())
             if not provenance:
-                return True
-
+                return set(pages)
             for source in provenance:
-                page = pages.get(int(source.page_no))
-                page_size = getattr(page, "size", None)
-                bbox = getattr(source, "bbox", None)
-                if page_size is None or bbox is None:
-                    return True
+                page_number = int(source.page_no)
+                if page_number in pages:
+                    image_pages.add(page_number)
+        return image_pages
 
-                try:
-                    page_area = float(page_size.width) * float(page_size.height)
-                    image_width = abs(float(bbox.r) - float(bbox.l))
-                    image_height = abs(float(bbox.t) - float(bbox.b))
-                except (AttributeError, TypeError, ValueError):
-                    return True
-                if page_area <= 0:
-                    return True
-                if image_width * image_height / page_area >= _MIN_IMAGE_AREA_RATIO_FOR_OCR:
-                    return True
-        return False
+    @staticmethod
+    def _native_text_is_suspicious(text: str) -> bool:
+        if not text.strip():
+            return True
+        if "\ufffd" in text or any(
+            ord(character) < 32 and character not in "\n\r\t"
+            for character in text
+        ):
+            return True
+
+        words = _WORD_PATTERN.findall(text)
+        suspicious_words = sum(
+            bool(_SUSPICIOUS_WORD_PATTERN.search(word)) for word in words
+        )
+        suspicious_characters = sum(
+            character in "~`#$%&<>|^"
+            for character in text
+        )
+        return suspicious_words >= 2 or suspicious_characters >= 2
+
+    @staticmethod
+    def _ocr_lines_missing_from_native(native_text: str, ocr_text: str) -> str:
+        native_tokens = [
+            token.casefold() for token in _WORD_PATTERN.findall(native_text)
+        ]
+        native_compact = "".join(
+            character.casefold()
+            for character in native_text
+            if character.isalnum()
+        )
+        additional_lines: list[str] = []
+        for line in ocr_text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            line_tokens = [token.casefold() for token in _WORD_PATTERN.findall(line)]
+            compact_line = "".join(
+                character.casefold()
+                for character in line
+                if character.isalnum()
+            )
+            if not compact_line:
+                continue
+            if compact_line in native_compact or _contains_token_sequence(
+                native_tokens,
+                line_tokens,
+            ):
+                continue
+            additional_lines.append(line)
+        if not additional_lines:
+            return ""
+        return (
+            "[OCR text not present in the PDF text layer]\n"
+            + "\n".join(additional_lines)
+        )
+
+    @staticmethod
+    def _join_text(first: str, second: str) -> str:
+        if not first.strip():
+            return second
+        if not second.strip():
+            return first
+        return f"{first}\n\n{second}"
 
     def _extract_ocr_pages(
         self,
         pages: dict[int, Any],
         filename: str,
-    ) -> dict[int, str]:
+    ) -> tuple[dict[int, str], dict[int, float]]:
+        if not pages:
+            return {}, {}
         reader = self._get_ocr_reader()
         result: dict[int, str] = {}
+        confidence: dict[int, float] = {}
         for page_number, page in pages.items():
             page_image = getattr(page, "image", None)
             pil_image = getattr(page_image, "pil_image", None)
@@ -247,11 +348,14 @@ class PdfExtractor:
                     f"Docling did not provide a rendered image for page {page_number} "
                     f"of {filename}"
                 )
-            result[page_number] = self._recognized_text(
+            text, page_confidence = self._recognized_text(
                 reader.ocr(np.asarray(image.convert("RGB")), cls=True),
                 page_number,
             )
-        return result
+            result[page_number] = text
+            if page_confidence is not None:
+                confidence[page_number] = page_confidence
+        return result, confidence
 
     def _get_ocr_reader(self) -> OCRReader:
         if self._ocr_reader is None:
@@ -268,15 +372,19 @@ class PdfExtractor:
         return self._ocr_reader
 
     @staticmethod
-    def _recognized_text(raw_result: Any, page_number: int) -> str:
+    def _recognized_text(
+        raw_result: Any,
+        page_number: int,
+    ) -> tuple[str, float | None]:
         if not isinstance(raw_result, list):
             raise ExtractionError(
                 f"PaddleOCR returned an invalid result for page {page_number}"
             )
         if not raw_result or raw_result[0] is None:
-            return ""
+            return "", None
 
         lines: list[str] = []
+        confidence_scores: list[float] = []
         for line in raw_result[0]:
             try:
                 recognized_text = line[1][0]
@@ -290,7 +398,16 @@ class PdfExtractor:
                 )
             if recognized_text.strip():
                 lines.append(recognized_text.strip())
-        return "\n".join(lines)
+                try:
+                    confidence_scores.append(float(line[1][1]))
+                except (IndexError, TypeError, ValueError):
+                    pass
+        mean_confidence = (
+            sum(confidence_scores) / len(confidence_scores)
+            if confidence_scores
+            else None
+        )
+        return "\n".join(lines), mean_confidence
 
     @staticmethod
     def _format_pages(pages: dict[int, str]) -> str:
@@ -300,10 +417,10 @@ class PdfExtractor:
         )
 
     @staticmethod
-    def _extract_embedded_pdfs(
+    def _extract_pdf_resources(
         source: Path | bytes,
         parent_filename: str,
-    ) -> tuple[EmbeddedPDF, ...]:
+    ) -> tuple[tuple[EmbeddedPDF, ...], set[int], set[int]]:
         try:
             from pypdf import PdfReader
         except ImportError as error:
@@ -317,9 +434,36 @@ class PdfExtractor:
         else:
             reader_source = BytesIO(source)
 
+        reader = PdfReader(reader_source)
+        image_pages: set[int] = set()
+        image_dominant_pages: set[int] = set()
+        for page_number, page in enumerate(getattr(reader, "pages", ()), start=1):
+            try:
+                images = page.images
+                if images:
+                    image_pages.add(page_number)
+                    page_area = (
+                        float(page.mediabox.width)
+                        * float(page.mediabox.height)
+                    )
+                    image_area = sum(
+                        float(image.image.width) * float(image.image.height)
+                        for image in images
+                    )
+                    if (
+                        page_area > 0
+                        and image_area / page_area >= _IMAGE_DOMINANT_PAGE_RATIO
+                    ):
+                        image_dominant_pages.add(page_number)
+            except Exception:
+                # An image the PDF reader cannot enumerate must not be silently
+                # skipped. OCR the rendered page as a conservative fallback.
+                image_pages.add(page_number)
+                image_dominant_pages.add(page_number)
+
         embedded: list[EmbeddedPDF] = []
         attachment_index = 0
-        for name, contents_list in PdfReader(reader_source).attachments.items():
+        for name, contents_list in reader.attachments.items():
             for contents in contents_list:
                 attachment_index += 1
                 if not _is_pdf_attachment(name, contents):
@@ -332,7 +476,17 @@ class PdfExtractor:
                         attachment_index=attachment_index,
                     )
                 )
-        return tuple(embedded)
+        return tuple(embedded), image_pages, image_dominant_pages
+
+
+def _contains_token_sequence(haystack: list[str], needle: list[str]) -> bool:
+    if not needle or len(needle) > len(haystack):
+        return False
+    needle_length = len(needle)
+    return any(
+        haystack[index : index + needle_length] == needle
+        for index in range(len(haystack) - needle_length + 1)
+    )
 
 
 def _is_pdf_attachment(name: str, content: bytes) -> bool:

@@ -57,10 +57,14 @@ before running Compose commands (for example, `export LOCAL_UID="$(id -u)"`
 and `export LOCAL_GID="$(id -g)"`).
 
 The extractor uses Docling's native PDF pipeline to parse text and render
-page images without running Docling OCR. It uses PaddleOCR for documents
-without usable native text and pypdf to discover embedded PDF attachments.
-Small logos and seals do not force OCR; a picture covering at least 5% of a
-page, or any page without usable native text, selects document-level OCR.
+page images, and PaddleOCR to read rendered pages. Every page containing an
+embedded image is OCR'd regardless of image size or count; this also catches
+scans stored as many small image strips. Pages with missing or visibly
+suspicious native text are OCR'd as well. Image-dominant pages use OCR text as
+their primary output; on mixed pages, readable native text is retained and
+OCR lines absent from the PDF text layer are added. The output metadata records
+OCR'd page numbers and mean PaddleOCR confidence by page when available. pypdf
+also discovers embedded PDF attachments.
 The attachment extraction support is pinned through `pypdf` in
 `requirements.txt`.
 
@@ -108,10 +112,11 @@ about 68 seconds, including 61 OCR pages. PaddleOCR ran on CPU with its default
 native pages are faster, so the actual document mix will reduce that estimate.
 Poor-quality synthetic scans had visibly noisier recognition than clean scans.
 A real 28-page PDF with selectable text and a small logo exposed a false OCR
-classification. The classifier now treats only substantial pictures as a
-reason to OCR the whole document, and the corrected output was verified using
-native text extraction. Output metadata includes a pipeline version so older
-results from the previous classification rule are regenerated automatically.
+classification. That behavior has since been changed: any embedded image now
+causes OCR of its page, while readable native text remains available in the
+output. The render scale is set near 300 dpi to preserve detail from common
+300 dpi scans. Output metadata includes a pipeline version so results from
+older extraction rules are regenerated automatically.
 
 ## Runtime assumptions and validation
 
