@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -15,11 +16,13 @@ class ProjectPaths:
 def get_project_paths(project_root: Path | None = None) -> ProjectPaths:
     root = (project_root or Path(__file__).resolve().parent.parent).resolve()
     data_dir = root / "data"
+    output_name = Path(os.getenv("OCR_OUTPUT_DIR", "output"))
+    output_dir = output_name if output_name.is_absolute() else data_dir / output_name
     return ProjectPaths(
         project_root=root,
         data_dir=data_dir,
         input_dir=data_dir / "input",
-        output_dir=data_dir / "output",
+        output_dir=output_dir,
         failed_dir=data_dir / "failed",
         database_path=data_dir / "documents.sqlite3",
     )

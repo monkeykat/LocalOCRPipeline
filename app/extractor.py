@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
 import re
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 from io import BytesIO
 from math import isfinite
 from pathlib import Path, PurePath
+from time import perf_counter
 from typing import Any, Protocol
 
 import numpy as np
@@ -56,10 +58,69 @@ class PDFExtraction:
     ocr_confidence: tuple[tuple[int, float], ...] = ()
     ocr_lines: tuple[tuple[int, tuple[OCRLine, ...]], ...] = ()
     native_regions: tuple[tuple[int, tuple[NativeTextRegion, ...]], ...] = ()
+    ocr_engine: str = "paddleocr"
+    ocr_time_seconds: float | None = None
+    extraction_time_seconds: float | None = None
 
 
 class OCRReader(Protocol):
     def ocr(self, image: np.ndarray, cls: bool = ...) -> Any: ...
+
+
+class TesseractOCRReader:
+    """Adapt Tesseract's word-level TSV output to the pipeline's OCR format."""
+
+    def __init__(self, pytesseract: Any) -> None:
+        self._pytesseract = pytesseract
+
+    def ocr(self, image: np.ndarray, cls: bool = False) -> list[list[Any]]:
+        del cls  # PaddleOCR's compatibility argument has no Tesseract equivalent.
+        data = self._pytesseract.image_to_data(
+            image,
+            lang="eng",
+            config="--oem 1 --psm 1",
+            output_type=self._pytesseract.Output.DICT,
+        )
+        grouped_words: dict[tuple[int, int, int, int], list[tuple[str, float, int, int, int, int]]] = {}
+        count = len(data.get("text", ()))
+        for index in range(count):
+            text = str(data["text"][index]).strip()
+            if not text:
+                continue
+            try:
+                confidence = float(data["conf"][index])
+                left = int(data["left"][index])
+                top = int(data["top"][index])
+                width = int(data["width"][index])
+                height = int(data["height"][index])
+                key = tuple(
+                    int(data.get(field, [0] * count)[index])
+                    for field in ("page_num", "block_num", "par_num", "line_num")
+                )
+            except (IndexError, TypeError, ValueError):
+                continue
+            if confidence < 0 or width <= 0 or height <= 0:
+                continue
+            grouped_words.setdefault(key, []).append(
+                (text, confidence, left, top, width, height)
+            )
+
+        lines: list[Any] = []
+        for words in grouped_words.values():
+            line_text = " ".join(word[0] for word in words)
+            line_confidence = sum(word[1] for word in words) / len(words) / 100
+            left = min(word[2] for word in words)
+            top = min(word[3] for word in words)
+            right = max(word[2] + word[4] for word in words)
+            bottom = max(word[3] + word[5] for word in words)
+            polygon = (
+                (left, top),
+                (right, top),
+                (right, bottom),
+                (left, bottom),
+            )
+            lines.append([polygon, (line_text, line_confidence)])
+        return [lines]
 
 
 class PDFConverter(Protocol):
@@ -73,14 +134,22 @@ class PdfExtractor:
         ocr_reader: OCRReader | None = None,
         *,
         image_scale: float = _OCR_IMAGE_SCALE,
+        ocr_engine: str | None = None,
     ) -> None:
         if image_scale <= 0:
             raise ValueError("image_scale must be greater than zero")
         self._converter = converter
         self._ocr_reader = ocr_reader
         self._image_scale = image_scale
+        engine = (ocr_engine or os.getenv("OCR_ENGINE", "paddleocr")).strip().lower()
+        if engine not in {"paddleocr", "tesseract"}:
+            raise ValueError(
+                f"Unsupported OCR_ENGINE {engine!r}; choose 'paddleocr' or 'tesseract'"
+            )
+        self.ocr_engine = engine
 
     def extract(self, source: Path | bytes, filename: str | None = None) -> PDFExtraction:
+        extraction_started = perf_counter()
         source_name = filename or (source.name if isinstance(source, Path) else None)
         if not source_name:
             raise ValueError("filename is required when extracting PDF bytes")
@@ -120,9 +189,13 @@ class PdfExtractor:
             page_number: page_items[page_number]
             for page_number in sorted(pages_to_ocr)
         }
+        ocr_started = perf_counter()
         ocr_pages, ocr_confidence = self._extract_ocr_pages(
             pages_for_ocr,
             source_name,
+        )
+        ocr_time_seconds = (
+            perf_counter() - ocr_started if pages_for_ocr else None
         )
 
         page_texts: dict[int, str] = {}
@@ -161,6 +234,9 @@ class PdfExtractor:
                 (page_number, tuple(regions))
                 for page_number, regions in sorted(native_regions.items())
             ),
+            ocr_engine=self.ocr_engine,
+            ocr_time_seconds=ocr_time_seconds,
+            extraction_time_seconds=perf_counter() - extraction_started,
         )
 
     def _get_converter(self) -> PDFConverter:
@@ -483,6 +559,16 @@ class PdfExtractor:
 
     def _get_ocr_reader(self) -> OCRReader:
         if self._ocr_reader is None:
+            if self.ocr_engine == "tesseract":
+                try:
+                    import pytesseract
+                except ImportError as error:
+                    raise ExtractionError(
+                        "pytesseract is required for the Tesseract OCR engine; "
+                        "install project requirements"
+                    ) from error
+                self._ocr_reader = TesseractOCRReader(pytesseract)
+                return self._ocr_reader
             try:
                 # PaddlePaddle 2.6 loads a bundled zlib symbol that can break
                 # later imports of SciPy's native modules on ARM64.

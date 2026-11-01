@@ -7,6 +7,23 @@ services:
     command: ["python", "-m", "app.main"]
     environment:
       HOME: /models
+      OCR_ENGINE: ${OCR_ENGINE:-paddleocr}
+      OCR_OUTPUT_DIR: ${OCR_OUTPUT_DIR:-output}
+    network_mode: none
+    volumes:
+      - ./data:/app/data
+      - ./models:/models
+
+  extractor-tesseract:
+    build: .
+    init: true
+    user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
+    working_dir: /app
+    command: ["python", "-m", "app.main"]
+    environment:
+      HOME: /models
+      OCR_ENGINE: tesseract
+      OCR_OUTPUT_DIR: output_tesseract
     network_mode: none
     volumes:
       - ./data:/app/data

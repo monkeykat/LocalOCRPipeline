@@ -6,12 +6,15 @@ env/
 data/*
 !data/input/
 !data/output/
+!data/output_tesseract/
 !data/failed/
 !data/documents.sqlite3
 data/input/*
 !data/input/.gitkeep
 data/output/*
 !data/output/.gitkeep
+data/output_tesseract/*
+!data/output_tesseract/.gitkeep
 data/failed/*
 !data/failed/.gitkeep
 __pycache__/

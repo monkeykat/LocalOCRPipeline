@@ -1,8 +1,8 @@
 # Local PDF Extractor
 
 Dockerized, local PDF text extraction and OCR for the HP ZGX Nano POC. The
-runtime container has no network access. Build the image and prepare the
-PaddleOCR models before processing documents offline.
+runtime containers have no network access. PaddleOCR remains the default; a
+Tesseract service is available for side-by-side comparison.
 
 ## Project layout
 
@@ -10,6 +10,7 @@ PaddleOCR models before processing documents offline.
 app/                  Python application package
 data/input/           Source PDFs
 data/output/          Extracted text
+data/output_tesseract/ Tesseract comparison output
 data/failed/          Failed source PDFs or failure records
 data/documents.sqlite3 SQLite processing and error tracking
 models/               Persistent, locally cached model artifacts
@@ -21,14 +22,15 @@ Run these commands on the target machine so Docker selects its native
 architecture (the HP ZGX Nano is an ARM64 system):
 
 ```sh
-docker compose build
+docker compose build extractor extractor-tesseract prepare-models
 docker compose --profile model-setup run --rm prepare-models
 ```
 
 The preparation service initializes PaddleOCR's English models under
-`models/.paddleocr/`. Retain `models/` for offline runs. This pipeline uses
-Docling's native PDF parser and renderer, which do not require Docling model
-weights, so the image installs only the `docling-slim` PDF extra.
+`models/.paddleocr/`. Retain `models/` for offline PaddleOCR runs. Tesseract
+and its English and orientation data are installed in the Docker image; no
+model download step is needed for Tesseract. Both services use Docling's native
+PDF parser and renderer, which do not require Docling model weights.
 
 ## Run
 
@@ -44,9 +46,40 @@ Or run the same CLI in the isolated Docker runtime:
 docker compose run --rm extractor
 ```
 
-The service runs with Docker networking disabled. PaddleOCR models must
-already exist in `models/`; missing artifacts cannot be downloaded at runtime.
-Application processing is local; never enable remote OCR or cloud services.
+To run the same inputs with Tesseract, keeping the PaddleOCR files intact:
+
+```sh
+docker compose run --rm extractor-tesseract
+```
+
+PaddleOCR continues to write under `data/output/`; Tesseract writes under
+`data/output_tesseract/`. Both use the same input folder, page rendering,
+page selection, and metadata structure. Run the two services sequentially;
+they share the SQLite processing database. To compare available outputs,
+including Azure reference files when present, run:
+
+```sh
+python3 -m scripts.compare_ocr_outputs
+```
+
+The report's percentages are normalized word-order similarity indicators,
+not accuracy scores. Azure Document Intelligence is a useful reference but
+not guaranteed ground truth. OCR confidence values are recorded per engine,
+but their scales are not directly comparable. The report also shows per-file
+OCR time and full extraction time, plus aggregate speedups for files timed by
+both engines. OCR time includes engine initialization and OCR calls; full
+extraction time includes PDF parsing and rendering, but excludes Docker startup
+and writing output files. The first PaddleOCR document may include model-load
+time in its OCR timing.
+
+The engine and output folder can also be selected with `OCR_ENGINE` and
+`OCR_OUTPUT_DIR`. For example, set both to `tesseract` and `output_tesseract`
+to retain the separate Tesseract result folder.
+
+Both runtime services run with Docker networking disabled. PaddleOCR models
+must already exist in `models/`; missing artifacts cannot be downloaded at
+runtime. Application processing is local; never enable remote OCR or cloud
+services.
 
 The compose service mounts `data/` and `models/` from the project directory so
 outputs, failure records, SQLite status, and model caches persist across
@@ -57,8 +90,8 @@ before running Compose commands (for example, `export LOCAL_UID="$(id -u)"`
 and `export LOCAL_GID="$(id -g)"`).
 
 The extractor uses Docling's native PDF pipeline to parse text and render
-page images, and PaddleOCR to read rendered pages. Every page containing an
-embedded image is OCR'd regardless of image size or count; this also catches
+page images, and the selected OCR engine to read rendered pages. Every page
+containing an embedded image is OCR'd regardless of image size or count; this catches
 scans stored as many small image strips. Pages with missing or visibly
 suspicious native text are OCR'd as well. Readable PDF text is retained even
 when images cover most of a page; OCR lines not already represented in the
@@ -66,8 +99,11 @@ text layer are added under the correct page with their normalized page
 coordinates. OCR lines, confidence, and polygons, along with native text
 regions and bounding boxes, are recorded under their page numbers in the JSON
 metadata. Coordinates use a top-left origin and range from 0 to 1. The output
-metadata also records OCR'd page numbers and mean PaddleOCR confidence by page
-when available. pypdf discovers embedded PDF attachments.
+metadata records the selected OCR engine, OCR'd page numbers, and mean
+per-page confidence when available. It also records OCR and full extraction
+durations in seconds. Tesseract word confidences are grouped by line and
+normalized to the same 0-to-1 range for storage. pypdf discovers embedded PDF
+attachments.
 The attachment extraction support is pinned through `pypdf` in
 `requirements.txt`.
 
@@ -126,11 +162,13 @@ older extraction rules are regenerated automatically.
 - Python 3.11 on Debian Bookworm; the image builds for the host's native
   architecture.
 - Docling Slim 2.135.0 with PDF support, PaddleOCR 2.10.0, PaddlePaddle 2.6.2,
-  NumPy 1.26.4, Pyclipper 1.3.0.post6, and Rtree 1.4.1 are pinned in
-  `requirements.txt`. The Pyclipper pin avoids an ARM64 binary conflict with
-  PaddlePaddle 2.6.2; the app also loads SciPy before PaddleOCR to avoid its
-  bundled zlib symbol conflict on ARM64. PaddlePaddle is the CPU package and
-  publishes a Python 3.11 Linux ARM64 wheel. The built image is about 1.45 GB.
+  pytesseract 0.3.13, NumPy 1.26.4, Pyclipper 1.3.0.post6, and Rtree 1.4.1
+  are pinned in `requirements.txt`. The image also installs Tesseract with
+  English and orientation data. The Pyclipper pin avoids an ARM64 binary
+  conflict with PaddlePaddle 2.6.2; the app loads SciPy before PaddleOCR to
+  avoid its bundled zlib symbol conflict on ARM64. PaddlePaddle is the CPU
+  package and publishes a Python 3.11 Linux ARM64 wheel. The built image is
+  about 1.45 GB before the Tesseract packages are added.
 - The validated host is ARM64 with 20 CPU cores, an NVIDIA GB10, and 121.6 GiB
   visible RAM. PaddleOCR ran on CPU; the Compose service does not request GPU
   access. Docling renders at 4 pixels per PDF point (about 288 dpi) for OCR

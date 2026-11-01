@@ -32,7 +32,7 @@ from app.paths import (
     output_path_for,
 )
 
-_EXTRACTION_PIPELINE_VERSION = 6
+_EXTRACTION_PIPELINE_VERSION = 7
 
 
 class Extractor(Protocol):
@@ -63,6 +63,9 @@ class DocumentProcessor:
     ) -> None:
         self.paths = paths or get_project_paths()
         self.extractor = extractor or PdfExtractor()
+        self.ocr_engine = str(
+            getattr(self.extractor, "ocr_engine", os.getenv("OCR_ENGINE", "paddleocr"))
+        ).strip().lower()
         initialize_database(self.paths)
         ensure_data_directories(self.paths)
         with connect_database(self.paths.database_path) as connection:
@@ -310,12 +313,20 @@ class DocumentProcessor:
             "filename": filename,
             "file_hash": file_hash,
             "pipeline_version": _EXTRACTION_PIPELINE_VERSION,
+            "ocr_engine": extraction.ocr_engine,
             "page_count": extraction.page_count,
             "extraction_method": extraction.extraction_method.value,
             "status": DocumentStatus.COMPLETE.value.lower(),
         }
         if extraction.ocr_pages:
             metadata["ocr_pages"] = list(extraction.ocr_pages)
+        if extraction.ocr_time_seconds is not None:
+            metadata["ocr_time_seconds"] = round(extraction.ocr_time_seconds, 3)
+        if extraction.extraction_time_seconds is not None:
+            metadata["extraction_time_seconds"] = round(
+                extraction.extraction_time_seconds,
+                3,
+            )
         if extraction.ocr_confidence:
             metadata["ocr_confidence_by_page"] = {
                 str(page_number): round(confidence, 4)
@@ -393,6 +404,8 @@ class DocumentProcessor:
                 continue
             if metadata.get("pipeline_version") != _EXTRACTION_PIPELINE_VERSION:
                 continue
+            if metadata.get("ocr_engine", "paddleocr") != self.ocr_engine:
+                continue
             text_path = metadata_path.with_suffix(".txt")
             if not text_path.is_file():
                 continue
@@ -423,12 +436,15 @@ class DocumentProcessor:
             "filename": filename,
             "file_hash": file_hash,
             "pipeline_version": _EXTRACTION_PIPELINE_VERSION,
+            "ocr_engine": self.ocr_engine,
             "page_count": cached_metadata["page_count"],
             "extraction_method": cached_metadata["extraction_method"],
             "status": DocumentStatus.COMPLETE.value.lower(),
         }
         for key in (
             "ocr_pages",
+            "ocr_time_seconds",
+            "extraction_time_seconds",
             "ocr_confidence_by_page",
             "ocr_lines_by_page",
             "native_text_regions_by_page",
