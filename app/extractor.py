@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from difflib import SequenceMatcher
 from io import BytesIO
 from math import isfinite
@@ -61,6 +61,8 @@ class PDFExtraction:
     ocr_engine: str = "paddleocr"
     ocr_time_seconds: float | None = None
     extraction_time_seconds: float | None = None
+    quality_assessment: dict[str, Any] | None = None
+    fusion_assessment: dict[str, Any] | None = None
 
 
 class OCRReader(Protocol):
@@ -135,18 +137,30 @@ class PdfExtractor:
         *,
         image_scale: float = _OCR_IMAGE_SCALE,
         ocr_engine: str | None = None,
+        fusion_threshold: float | None = None,
     ) -> None:
         if image_scale <= 0:
             raise ValueError("image_scale must be greater than zero")
         self._converter = converter
-        self._ocr_reader = ocr_reader
         self._image_scale = image_scale
         engine = (ocr_engine or os.getenv("OCR_ENGINE", "paddleocr")).strip().lower()
-        if engine not in {"paddleocr", "tesseract"}:
+        if engine not in {"paddleocr", "tesseract", "fused"}:
             raise ValueError(
-                f"Unsupported OCR_ENGINE {engine!r}; choose 'paddleocr' or 'tesseract'"
+                f"Unsupported OCR_ENGINE {engine!r}; choose 'paddleocr', "
+                "'tesseract', or 'fused'"
             )
         self.ocr_engine = engine
+        if fusion_threshold is None:
+            fusion_threshold = (
+                _read_fusion_threshold_env() if engine == "fused" else 90.0
+            )
+        if not 0 <= fusion_threshold <= 100:
+            raise ValueError("fusion_threshold must be between 0 and 100")
+        self.fusion_threshold = float(fusion_threshold)
+        self._ocr_readers: dict[str, OCRReader] = {}
+        if ocr_reader is not None:
+            reader_engine = "tesseract" if engine == "fused" else engine
+            self._ocr_readers[reader_engine] = ocr_reader
 
     def extract(self, source: Path | bytes, filename: str | None = None) -> PDFExtraction:
         extraction_started = perf_counter()
@@ -189,14 +203,178 @@ class PdfExtractor:
             page_number: page_items[page_number]
             for page_number in sorted(pages_to_ocr)
         }
+        if self.ocr_engine == "fused":
+            return self._extract_fused(
+                pages_for_ocr=pages_for_ocr,
+                native_pages=native_pages,
+                native_regions=native_regions,
+                embedded_pdfs=embedded_pdfs,
+                page_count=page_count,
+                pages_to_ocr=pages_to_ocr,
+                source_name=source_name,
+                extraction_started=extraction_started,
+            )
+
         ocr_started = perf_counter()
         ocr_pages, ocr_confidence = self._extract_ocr_pages(
             pages_for_ocr,
             source_name,
+            engine=self.ocr_engine,
         )
         ocr_time_seconds = (
             perf_counter() - ocr_started if pages_for_ocr else None
         )
+
+        return self._assemble_extraction(
+            native_pages=native_pages,
+            native_regions=native_regions,
+            embedded_pdfs=embedded_pdfs,
+            page_count=page_count,
+            pages_to_ocr=pages_to_ocr,
+            ocr_pages=ocr_pages,
+            ocr_confidence=ocr_confidence,
+            ocr_engine=self.ocr_engine,
+            ocr_time_seconds=ocr_time_seconds,
+            extraction_started=extraction_started,
+        )
+
+    def _extract_fused(
+        self,
+        *,
+        pages_for_ocr: dict[int, Any],
+        native_pages: dict[int, str],
+        native_regions: dict[int, list[NativeTextRegion]],
+        embedded_pdfs: tuple[EmbeddedPDF, ...],
+        page_count: int,
+        pages_to_ocr: set[int],
+        source_name: str,
+        extraction_started: float,
+    ) -> PDFExtraction:
+        from app.fusion import fuse_ocr_lines
+
+        tesseract_started = perf_counter()
+        tesseract_lines, tesseract_confidence = self._extract_ocr_pages(
+            pages_for_ocr,
+            source_name,
+            engine="tesseract",
+        )
+        tesseract_time = (
+            perf_counter() - tesseract_started if pages_for_ocr else None
+        )
+        tesseract_extraction = self._assemble_extraction(
+            native_pages=native_pages,
+            native_regions=native_regions,
+            embedded_pdfs=embedded_pdfs,
+            page_count=page_count,
+            pages_to_ocr=pages_to_ocr,
+            ocr_pages=tesseract_lines,
+            ocr_confidence=tesseract_confidence,
+            ocr_engine="tesseract",
+            ocr_time_seconds=tesseract_time,
+            extraction_started=extraction_started,
+        )
+        tesseract_quality = self._assess_quality(tesseract_extraction)
+        tesseract_score = tesseract_quality.get("score")
+        if (
+            not pages_for_ocr
+            or tesseract_score is None
+            or float(tesseract_score) > self.fusion_threshold
+        ):
+            return replace(
+                tesseract_extraction,
+                ocr_engine="fused",
+                quality_assessment=tesseract_quality,
+                fusion_assessment={
+                    "mode": "tesseract_first_paddle_fallback",
+                    "threshold": self.fusion_threshold,
+                    "threshold_comparison": (
+                        "Run PaddleOCR when Tesseract quality score <= threshold"
+                    ),
+                    "tesseract_quality_score": tesseract_score,
+                    "tesseract_quality_assessment": tesseract_quality,
+                    "paddle_fallback_triggered": False,
+                    "selected_engine": "tesseract",
+                },
+            )
+
+        paddle_started = perf_counter()
+        paddle_lines, paddle_confidence = self._extract_ocr_pages(
+            pages_for_ocr,
+            source_name,
+            engine="paddleocr",
+        )
+        paddle_time = perf_counter() - paddle_started
+        paddle_extraction = self._assemble_extraction(
+            native_pages=native_pages,
+            native_regions=native_regions,
+            embedded_pdfs=embedded_pdfs,
+            page_count=page_count,
+            pages_to_ocr=pages_to_ocr,
+            ocr_pages=paddle_lines,
+            ocr_confidence=paddle_confidence,
+            ocr_engine="paddleocr",
+            ocr_time_seconds=paddle_time,
+            extraction_started=extraction_started,
+        )
+        paddle_quality = self._assess_quality(paddle_extraction)
+        fused = fuse_ocr_lines(
+            tesseract_lines,
+            paddle_lines,
+            native_regions,
+            tesseract_quality=tesseract_quality,
+            paddle_quality=paddle_quality,
+            threshold=self.fusion_threshold,
+        )
+        fusion_assessment = dict(fused.assessment)
+        fusion_assessment["paddle_fallback_triggered"] = True
+        fusion_assessment["tesseract_quality_score"] = tesseract_score
+        fusion_assessment["paddle_quality_score"] = paddle_quality.get("score")
+        extraction = self._assemble_extraction(
+            native_pages=native_pages,
+            native_regions=native_regions,
+            embedded_pdfs=embedded_pdfs,
+            page_count=page_count,
+            pages_to_ocr=pages_to_ocr,
+            ocr_pages=fused.lines_by_page,
+            ocr_confidence=fused.confidence_by_page,
+            ocr_engine="fused",
+            ocr_time_seconds=(tesseract_time or 0.0) + paddle_time,
+            extraction_started=extraction_started,
+            fusion_assessment=fusion_assessment,
+        )
+        combined_quality = self._assess_quality(extraction)
+        combined_quality["method"] = "mixed_engine_heuristic_v1"
+        combined_quality["note"] = (
+            "This score is based on fused lines and mixed engine confidences; "
+            "compare it cautiously with single-engine scores."
+        )
+        return replace(extraction, quality_assessment=combined_quality)
+
+    @staticmethod
+    def _assess_quality(extraction: PDFExtraction) -> dict[str, Any]:
+        from app.postprocessor import review_flags_by_page
+        from app.quality import assess_extraction_quality
+
+        return assess_extraction_quality(
+            extraction,
+            review_flags_by_page(extraction.ocr_lines),
+        )
+
+    def _assemble_extraction(
+        self,
+        *,
+        native_pages: dict[int, str],
+        native_regions: dict[int, list[NativeTextRegion]],
+        embedded_pdfs: tuple[EmbeddedPDF, ...],
+        page_count: int,
+        pages_to_ocr: set[int],
+        ocr_pages: dict[int, tuple[OCRLine, ...]],
+        ocr_confidence: dict[int, float],
+        ocr_engine: str,
+        ocr_time_seconds: float | None,
+        extraction_started: float,
+        fusion_assessment: dict[str, Any] | None = None,
+    ) -> PDFExtraction:
 
         page_texts: dict[int, str] = {}
         for page_number, native_text in native_pages.items():
@@ -234,9 +412,10 @@ class PdfExtractor:
                 (page_number, tuple(regions))
                 for page_number, regions in sorted(native_regions.items())
             ),
-            ocr_engine=self.ocr_engine,
+            ocr_engine=ocr_engine,
             ocr_time_seconds=ocr_time_seconds,
             extraction_time_seconds=perf_counter() - extraction_started,
+            fusion_assessment=fusion_assessment,
         )
 
     def _get_converter(self) -> PDFConverter:
@@ -530,10 +709,12 @@ class PdfExtractor:
         self,
         pages: dict[int, Any],
         filename: str,
+        *,
+        engine: str,
     ) -> tuple[dict[int, tuple[OCRLine, ...]], dict[int, float]]:
         if not pages:
             return {}, {}
-        reader = self._get_ocr_reader()
+        reader = self._get_ocr_reader(engine)
         result: dict[int, tuple[OCRLine, ...]] = {}
         confidence: dict[int, float] = {}
         for page_number, page in pages.items():
@@ -557,18 +738,22 @@ class PdfExtractor:
                 confidence[page_number] = page_confidence
         return result, confidence
 
-    def _get_ocr_reader(self) -> OCRReader:
-        if self._ocr_reader is None:
-            if self.ocr_engine == "tesseract":
-                try:
-                    import pytesseract
-                except ImportError as error:
-                    raise ExtractionError(
-                        "pytesseract is required for the Tesseract OCR engine; "
-                        "install project requirements"
-                    ) from error
-                self._ocr_reader = TesseractOCRReader(pytesseract)
-                return self._ocr_reader
+    def _get_ocr_reader(self, engine: str) -> OCRReader:
+        if engine == "fused":
+            raise ValueError("The fused mode requires a specific OCR engine per pass")
+        reader = self._ocr_readers.get(engine)
+        if reader is not None:
+            return reader
+        if engine == "tesseract":
+            try:
+                import pytesseract
+            except ImportError as error:
+                raise ExtractionError(
+                    "pytesseract is required for the Tesseract OCR engine; "
+                    "install project requirements"
+                ) from error
+            reader = TesseractOCRReader(pytesseract)
+        elif engine == "paddleocr":
             try:
                 # PaddlePaddle 2.6 loads a bundled zlib symbol that can break
                 # later imports of SciPy's native modules on ARM64.
@@ -578,8 +763,11 @@ class PdfExtractor:
                 raise ExtractionError(
                     "PaddleOCR is required for scanned PDFs; install project requirements"
                 ) from error
-            self._ocr_reader = PaddleOCR(use_angle_cls=True, lang="en")
-        return self._ocr_reader
+            reader = PaddleOCR(use_angle_cls=True, lang="en")
+        else:
+            raise ValueError(f"Unsupported OCR engine {engine!r}")
+        self._ocr_readers[engine] = reader
+        return reader
 
     @staticmethod
     def _recognized_text(
@@ -777,6 +965,17 @@ def _similar_text_in_region(needle: list[str], region_text: str) -> bool:
 
 def _is_pdf_attachment(name: str, content: bytes) -> bool:
     return name.lower().endswith(".pdf") or b"%PDF-" in content[:1024]
+
+
+def _read_fusion_threshold_env() -> float:
+    raw_value = os.getenv("OCR_FUSION_THRESHOLD", "90")
+    try:
+        value = float(raw_value)
+    except ValueError as error:
+        raise ValueError("OCR_FUSION_THRESHOLD must be a number from 0 to 100") from error
+    if not 0 <= value <= 100:
+        raise ValueError("OCR_FUSION_THRESHOLD must be between 0 and 100")
+    return value
 
 
 def _safe_pdf_filename(name: str, attachment_index: int) -> str:

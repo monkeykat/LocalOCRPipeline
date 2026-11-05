@@ -31,8 +31,10 @@ from app.paths import (
     get_project_paths,
     output_path_for,
 )
+from app.postprocessor import clean_transcript, review_flags_by_page
+from app.quality import assess_extraction_quality
 
-_EXTRACTION_PIPELINE_VERSION = 7
+_EXTRACTION_PIPELINE_VERSION = 10
 
 
 class Extractor(Protocol):
@@ -66,6 +68,18 @@ class DocumentProcessor:
         self.ocr_engine = str(
             getattr(self.extractor, "ocr_engine", os.getenv("OCR_ENGINE", "paddleocr"))
         ).strip().lower()
+        self.fusion_threshold = (
+            float(
+                getattr(
+                    self.extractor,
+                    "fusion_threshold",
+                    os.getenv("OCR_FUSION_THRESHOLD", "90"),
+                )
+            )
+            if self.ocr_engine == "fused"
+            else None
+        )
+        self.post_cleanup_enabled = _read_bool_env("OCR_POST_CLEANUP", default=True)
         initialize_database(self.paths)
         ensure_data_directories(self.paths)
         with connect_database(self.paths.database_path) as connection:
@@ -318,6 +332,21 @@ class DocumentProcessor:
             "extraction_method": extraction.extraction_method.value,
             "status": DocumentStatus.COMPLETE.value.lower(),
         }
+        review_flags = review_flags_by_page(extraction.ocr_lines)
+        metadata["quality_assessment"] = (
+            extraction.quality_assessment
+            or assess_extraction_quality(extraction, review_flags)
+        )
+        if extraction.fusion_assessment is not None:
+            metadata["fusion_assessment"] = extraction.fusion_assessment
+        if self.post_cleanup_enabled:
+            metadata["post_cleanup"] = {
+                "enabled": True,
+                "cleaned_output": _cleaned_output_path(output_path).name,
+                "word_corrections_applied": 0,
+            }
+            if review_flags:
+                metadata["ocr_review_flags_by_page"] = review_flags
         if extraction.ocr_pages:
             metadata["ocr_pages"] = list(extraction.ocr_pages)
         if extraction.ocr_time_seconds is not None:
@@ -387,8 +416,18 @@ class DocumentProcessor:
                 output_path,
                 f"DOCUMENT: {filename}\n\n{extraction.text}\n",
             )
+            cleaned_path = _cleaned_output_path(output_path)
+            if self.post_cleanup_enabled:
+                _atomic_write_text(
+                    cleaned_path,
+                    clean_transcript(f"DOCUMENT: {filename}\n\n{extraction.text}\n"),
+                )
+            else:
+                cleaned_path.unlink(missing_ok=True)
         except Exception:
             metadata_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+            _cleaned_output_path(output_path).unlink(missing_ok=True)
             raise
 
     def _find_cached_output(
@@ -406,6 +445,16 @@ class DocumentProcessor:
                 continue
             if metadata.get("ocr_engine", "paddleocr") != self.ocr_engine:
                 continue
+            if self.ocr_engine == "fused":
+                fusion_assessment = metadata.get("fusion_assessment")
+                if not isinstance(fusion_assessment, dict):
+                    continue
+                try:
+                    cached_threshold = float(fusion_assessment["threshold"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if cached_threshold != self.fusion_threshold:
+                    continue
             text_path = metadata_path.with_suffix(".txt")
             if not text_path.is_file():
                 continue
@@ -448,9 +497,21 @@ class DocumentProcessor:
             "ocr_confidence_by_page",
             "ocr_lines_by_page",
             "native_text_regions_by_page",
+            "quality_assessment",
+            "fusion_assessment",
         ):
             if key in cached_metadata:
                 metadata[key] = cached_metadata[key]
+        if self.post_cleanup_enabled:
+            metadata["post_cleanup"] = {
+                "enabled": True,
+                "cleaned_output": _cleaned_output_path(output_path).name,
+                "word_corrections_applied": 0,
+            }
+            if "ocr_review_flags_by_page" in cached_metadata:
+                metadata["ocr_review_flags_by_page"] = cached_metadata[
+                    "ocr_review_flags_by_page"
+                ]
         if parent_context is not None:
             metadata["parent"] = parent_context
 
@@ -461,14 +522,25 @@ class DocumentProcessor:
                 output_path,
                 f"DOCUMENT: {filename}\n\n{extracted_text}",
             )
+            cleaned_path = _cleaned_output_path(output_path)
+            if self.post_cleanup_enabled:
+                _atomic_write_text(
+                    cleaned_path,
+                    clean_transcript(f"DOCUMENT: {filename}\n\n{extracted_text}"),
+                )
+            else:
+                cleaned_path.unlink(missing_ok=True)
         except Exception:
             metadata_path.unlink(missing_ok=True)
+            output_path.unlink(missing_ok=True)
+            _cleaned_output_path(output_path).unlink(missing_ok=True)
             raise
 
     def _remove_output_artifacts(self, output_relative_path: Path) -> None:
         output_path = self._output_path(output_relative_path)
         output_path.unlink(missing_ok=True)
         output_path.with_suffix(".json").unlink(missing_ok=True)
+        _cleaned_output_path(output_path).unlink(missing_ok=True)
 
     @staticmethod
     def _remove_failed_copy(failed_path: Path) -> None:
@@ -510,6 +582,24 @@ def _hash_content(source: Path | bytes) -> str:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _cleaned_output_path(output_path: Path) -> Path:
+    return output_path.with_name(f"{output_path.stem}.cleaned.txt")
+
+
+def _read_bool_env(name: str, *, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    value = raw_value.strip().casefold()
+    if value in {"1", "true", "yes", "on"}:
+        return True
+    if value in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(
+        f"{name} must be a boolean value (true/false, 1/0, yes/no, on/off)"
+    )
 
 
 def _embedded_output_path(
