@@ -13,14 +13,11 @@ from typing import Any, Protocol
 import numpy as np
 
 from app.database import ExtractionMethod
+from app.text_quality import assess_native_text
 
 # Four pixels per PDF point is about 288 dpi, close to a common 300 dpi scan.
 _OCR_IMAGE_SCALE = 4.0
 _WORD_PATTERN = re.compile(r"[A-Za-z]+(?:['’\-][A-Za-z]+)?")
-_SUSPICIOUS_WORD_PATTERN = re.compile(
-    r"[A-Za-z][~`#$%&+<>;|][A-Za-z]|([A-Za-z])\1\1|"
-    r"[A-Z][a-z]+[A-Z][a-z]"
-)
 
 
 class ExtractionError(RuntimeError):
@@ -63,6 +60,7 @@ class PDFExtraction:
     extraction_time_seconds: float | None = None
     quality_assessment: dict[str, Any] | None = None
     fusion_assessment: dict[str, Any] | None = None
+    native_text_assessment: dict[str, Any] | None = None
 
 
 class OCRReader(Protocol):
@@ -196,7 +194,7 @@ class PdfExtractor:
         pages_to_ocr = {
             page_number
             for page_number, page_text in native_pages.items()
-            if self._native_text_is_suspicious(page_text)
+            if assess_native_text(page_text)["ocr_recommended"]
         }
         pages_to_ocr.update(image_pages)
         pages_for_ocr = {
@@ -274,12 +272,19 @@ class PdfExtractor:
             extraction_started=extraction_started,
         )
         tesseract_quality = self._assess_quality(tesseract_extraction)
-        tesseract_score = tesseract_quality.get("score")
-        if (
-            not pages_for_ocr
-            or tesseract_score is None
-            or float(tesseract_score) > self.fusion_threshold
-        ):
+        tesseract_page_quality = tesseract_quality.get("pages", {})
+        pages_for_paddle = {
+            page_number: page
+            for page_number, page in pages_for_ocr.items()
+            if (
+                (page_quality := tesseract_page_quality.get(str(page_number), {})).get(
+                    "score"
+                )
+                is None
+                or float(page_quality["score"]) <= self.fusion_threshold
+            )
+        }
+        if not pages_for_paddle:
             return replace(
                 tesseract_extraction,
                 ocr_engine="fused",
@@ -288,18 +293,19 @@ class PdfExtractor:
                     "mode": "tesseract_first_paddle_fallback",
                     "threshold": self.fusion_threshold,
                     "threshold_comparison": (
-                        "Run PaddleOCR when Tesseract quality score <= threshold"
+                        "Run PaddleOCR when a Tesseract page quality score <= threshold"
                     ),
-                    "tesseract_quality_score": tesseract_score,
+                    "tesseract_quality_score": tesseract_quality.get("score"),
                     "tesseract_quality_assessment": tesseract_quality,
                     "paddle_fallback_triggered": False,
+                    "paddle_fallback_pages": [],
                     "selected_engine": "tesseract",
                 },
             )
 
         paddle_started = perf_counter()
         paddle_lines, paddle_confidence = self._extract_ocr_pages(
-            pages_for_ocr,
+            pages_for_paddle,
             source_name,
             engine="paddleocr",
         )
@@ -309,7 +315,7 @@ class PdfExtractor:
             native_regions=native_regions,
             embedded_pdfs=embedded_pdfs,
             page_count=page_count,
-            pages_to_ocr=pages_to_ocr,
+            pages_to_ocr=set(pages_for_paddle),
             ocr_pages=paddle_lines,
             ocr_confidence=paddle_confidence,
             ocr_engine="paddleocr",
@@ -327,7 +333,8 @@ class PdfExtractor:
         )
         fusion_assessment = dict(fused.assessment)
         fusion_assessment["paddle_fallback_triggered"] = True
-        fusion_assessment["tesseract_quality_score"] = tesseract_score
+        fusion_assessment["paddle_fallback_pages"] = sorted(pages_for_paddle)
+        fusion_assessment["tesseract_quality_score"] = tesseract_quality.get("score")
         fusion_assessment["paddle_quality_score"] = paddle_quality.get("score")
         extraction = self._assemble_extraction(
             native_pages=native_pages,
@@ -375,13 +382,28 @@ class PdfExtractor:
         extraction_started: float,
         fusion_assessment: dict[str, Any] | None = None,
     ) -> PDFExtraction:
-
+        native_page_assessments = {
+            str(page_number): assess_native_text(native_text)
+            for page_number, native_text in native_pages.items()
+        }
+        ocr_recommended_pages = [
+            int(page_number)
+            for page_number, assessment in native_page_assessments.items()
+            if assessment["ocr_recommended"]
+        ]
+        native_text_assessment = {
+            "method": "native_text_heuristic_v1",
+            "ocr_recommended": bool(ocr_recommended_pages),
+            "ocr_recommended_pages": ocr_recommended_pages,
+            "pages": native_page_assessments,
+        }
         page_texts: dict[int, str] = {}
         for page_number, native_text in native_pages.items():
             recognized_lines = ocr_pages.get(page_number, ())
+            page_assessment = native_page_assessments[str(page_number)]
             if not recognized_lines:
                 page_texts[page_number] = native_text
-            elif not native_text.strip():
+            elif page_assessment["ocr_recommended"]:
                 page_texts[page_number] = self._format_ocr_lines(recognized_lines)
             else:
                 supplemental_lines = self._uncovered_ocr_lines(
@@ -412,6 +434,7 @@ class PdfExtractor:
                 (page_number, tuple(regions))
                 for page_number, regions in sorted(native_regions.items())
             ),
+            native_text_assessment=native_text_assessment,
             ocr_engine=ocr_engine,
             ocr_time_seconds=ocr_time_seconds,
             extraction_time_seconds=perf_counter() - extraction_started,
@@ -610,23 +633,7 @@ class PdfExtractor:
 
     @staticmethod
     def _native_text_is_suspicious(text: str) -> bool:
-        if not text.strip():
-            return True
-        if "\ufffd" in text or any(
-            ord(character) < 32 and character not in "\n\r\t"
-            for character in text
-        ):
-            return True
-
-        words = _WORD_PATTERN.findall(text)
-        suspicious_words = sum(
-            bool(_SUSPICIOUS_WORD_PATTERN.search(word)) for word in words
-        )
-        suspicious_characters = sum(
-            character in "~`#$%&<>|^"
-            for character in text
-        )
-        return suspicious_words >= 2 or suspicious_characters >= 2
+        return bool(assess_native_text(text)["ocr_recommended"])
 
     @staticmethod
     def _uncovered_ocr_lines(

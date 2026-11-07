@@ -7,13 +7,16 @@ services:
     command: ["python", "-m", "app.main"]
     environment:
       HOME: /models
+      OCR_INPUT_DIR: /app/input
       OCR_ENGINE: ${OCR_ENGINE:-paddleocr}
       OCR_OUTPUT_DIR: ${OCR_OUTPUT_DIR:-output_PaddleOCR}
+      OCR_WORKERS: ${OCR_WORKERS:-2}
       OCR_POST_CLEANUP: ${OCR_POST_CLEANUP:-true}
     network_mode: none
     volumes:
       - ./data:/app/data
       - ./models:/models
+      - ${OCR_SOURCE_DIR:-/home/gulfaero/Documents/Code/AviationRegs/AviationRegs/documents}:/app/input:ro
 
   extractor-tesseract:
     build: .
@@ -23,13 +26,16 @@ services:
     command: ["python", "-m", "app.main"]
     environment:
       HOME: /models
+      OCR_INPUT_DIR: /app/input
       OCR_ENGINE: tesseract
       OCR_OUTPUT_DIR: output_tesseract
+      OCR_WORKERS: ${OCR_WORKERS:-2}
       OCR_POST_CLEANUP: ${OCR_POST_CLEANUP:-true}
     network_mode: none
     volumes:
       - ./data:/app/data
       - ./models:/models
+      - ${OCR_SOURCE_DIR:-/home/gulfaero/Documents/Code/AviationRegs/AviationRegs/documents}:/app/input:ro
 
   extractor-fused:
     build: .
@@ -37,16 +43,23 @@ services:
     user: "${LOCAL_UID:-1000}:${LOCAL_GID:-1000}"
     working_dir: /app
     command: ["python", "-m", "app.main"]
+    gpus: all
     environment:
       HOME: /models
+      OCR_INPUT_DIR: /app/input
       OCR_ENGINE: fused
       OCR_OUTPUT_DIR: ${OCR_FUSED_OUTPUT_DIR:-output_fused}
+      OCR_WORKERS: ${OCR_WORKERS:-2}
+      OCR_NATIVE_WORKERS: ${OCR_NATIVE_WORKERS:-}
+      OCR_OCR_WORKERS: ${OCR_OCR_WORKERS:-}
       OCR_FUSION_THRESHOLD: ${OCR_FUSION_THRESHOLD:-90}
       OCR_POST_CLEANUP: ${OCR_POST_CLEANUP:-true}
+      NVIDIA_DRIVER_CAPABILITIES: utility
     network_mode: none
     volumes:
       - ./data:/app/data
       - ./models:/models
+      - ${OCR_SOURCE_DIR:-/home/gulfaero/Documents/Code/AviationRegs/AviationRegs/documents}:/app/input:ro
 
   prepare-models:
     build: .

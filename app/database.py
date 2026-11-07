@@ -37,6 +37,14 @@ CREATE TABLE IF NOT EXISTS documents (
 CREATE INDEX IF NOT EXISTS idx_documents_hash_status
     ON documents (file_hash, status);
 
+CREATE TABLE IF NOT EXISTS classifications (
+    file_hash TEXT PRIMARY KEY,
+    classifier_version TEXT NOT NULL,
+    workload_type TEXT NOT NULL CHECK (workload_type IN ('native', 'ocr')),
+    reason TEXT NOT NULL,
+    classified_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+
 CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY,
     document_id INTEGER NOT NULL REFERENCES documents(id) ON DELETE CASCADE,
@@ -84,6 +92,51 @@ def register_document(
     if row is None:
         raise RuntimeError("Document registration did not return a document ID")
     return int(row["id"])
+
+
+def get_classification(
+    connection: sqlite3.Connection,
+    *,
+    file_hash: str,
+    classifier_version: str,
+) -> tuple[str, str] | None:
+    row = connection.execute(
+        """
+        SELECT workload_type, reason
+        FROM classifications
+        WHERE file_hash = ? AND classifier_version = ?
+        """,
+        (file_hash, classifier_version),
+    ).fetchone()
+    if row is None:
+        return None
+    return str(row["workload_type"]), str(row["reason"])
+
+
+def save_classification(
+    connection: sqlite3.Connection,
+    *,
+    file_hash: str,
+    classifier_version: str,
+    workload_type: str,
+    reason: str,
+) -> None:
+    if workload_type not in {"native", "ocr"}:
+        raise ValueError(f"Unsupported workload type: {workload_type}")
+    connection.execute(
+        """
+        INSERT INTO classifications (
+            file_hash, classifier_version, workload_type, reason, classified_at
+        )
+        VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)
+        ON CONFLICT (file_hash) DO UPDATE SET
+            classifier_version = excluded.classifier_version,
+            workload_type = excluded.workload_type,
+            reason = excluded.reason,
+            classified_at = CURRENT_TIMESTAMP
+        """,
+        (file_hash, classifier_version, workload_type, reason),
+    )
 
 
 def set_document_status(

@@ -8,7 +8,7 @@ individually, and a fused mode runs Tesseract first with PaddleOCR fallback.
 
 ```text
 app/                  Python application package
-data/input/           Source PDFs
+documents/            Source PDFs from AviationRegs
 data/output_PaddleOCR/ PaddleOCR output (default)
 data/output_tesseract/ Tesseract comparison output
 data/output_fused/    Thresholded Tesseract/PaddleOCR output
@@ -18,10 +18,15 @@ data/documents.sqlite3 SQLite processing and error tracking
 models/               Persistent, locally cached model artifacts
 ```
 
-PDFs can be organized in subfolders under `data/input/`. Each extraction
+The default input is
+`/home/gulfaero/Documents/Code/AviationRegs/AviationRegs/documents/`. Docker
+mounts it read-only at `/app/input`. Override the host source with
+`OCR_SOURCE_DIR=/path/to/documents`; direct Python runs can set `OCR_INPUT_DIR`.
+
+PDFs can be organized in subfolders under the source directory. Each extraction
 service preserves that relative folder structure under its output directory;
-for example, `data/input/invoices/2025/scan.pdf` produces
-`data/output_PaddleOCR/invoices/2025/scan.txt` (with its JSON and cleaned text
+for example, `documents/FAA/AC/scan.pdf` produces
+`data/output_PaddleOCR/FAA/AC/scan.txt` (with its JSON and cleaned text
 sidecars beside it).
 
 ## Build and prepare
@@ -44,7 +49,7 @@ or below its fallback threshold.
 
 ## Run
 
-Place PDFs in `data/input/`, then run the architecture's CLI:
+Run the architecture's CLI against the default AviationRegs documents folder:
 
 ```sh
 python -m app.main
@@ -68,15 +73,112 @@ To run thresholded fusion:
 docker compose run --rm extractor-fused
 ```
 
-Fusion runs Tesseract first. If its document quality score is at or below
-`OCR_FUSION_THRESHOLD` (default `90`), it runs PaddleOCR on the same OCR pages
-and merges the line detections using page positions, agreement, and support
-from native PDF text. Non-overlapping detections from both engines are kept.
-For conflicting overlapping lines, native-text support is used when it clearly
+Each batch uses up to two worker processes by default. Set `OCR_WORKERS` to
+change the number of PDFs processed at once; for example:
+
+```sh
+OCR_WORKERS=4 docker compose run --rm extractor-fused
+```
+
+Each worker runs its own extractor and OCR models, so memory use can rise with
+the worker count. Run one batch with the desired worker count instead of
+starting multiple extractor containers against the same input and output
+folders.
+
+If a worker process crashes, the batch retries its in-flight PDFs once and
+restarts that pool with the configured worker count. A document that fails
+again is recorded as failed and the rest of the pool continues. After five
+pool crashes in a row without a successful document, only that pool pauses;
+its remaining PDFs stay pending for the next run, while another pool can
+finish. If the operating system kills the whole container, rerun the same
+command; the database resets interrupted documents so processing resumes.
+
+To profile native and OCR workloads separately, run a single worker:
+
+```sh
+OCR_WORKERS=1 docker compose run --rm extractor-fused
+```
+
+Single-worker run metrics include per-document-type CPU and memory samples.
+Fused documents are classified as OCR if any page used OCR. Cached documents
+are counted separately and excluded from the resource profile. The profile
+includes the shared process baseline, so use its maximum memory figures as a
+conservative one-worker footprint when choosing concurrency. Separate-pool
+runs also report independent pool CPU and worker-process-tree RSS measurements;
+the overall cgroup measurements still show total container use.
+
+After profiling, separate pool limits can be set independently:
+
+```sh
+OCR_NATIVE_WORKERS=1 OCR_OCR_WORKERS=1 docker compose run --rm extractor-fused
+```
+
+Set both variables to choose exact caps. For example,
+`OCR_NATIVE_WORKERS=1 OCR_OCR_WORKERS=2` allows at most one native-pool job and
+two OCR-pool jobs at once (three workers total). If only one variable is set,
+the other pool uses `OCR_WORKERS` (default `2`). If neither is set,
+`OCR_WORKERS` retains the shared-pool behavior.
+
+Setting both limits to `3` allows up to six PDFs in flight: three assigned to
+the native pool and three assigned to the OCR pool.
+
+Separate-pool mode preflights PDFs before processing: only high-confidence
+text-only PDFs go to the native pool; image-heavy, uncertain, encrypted, or
+unreadable PDFs go to the OCR pool. The startup output and run metrics report
+the predicted native/OCR counts and each pool's worker cap. The extractor
+checks each result afterward and logs any native-to-OCR misclassification,
+which can make actual OCR use exceed the OCR-pool cap for that document. The
+preflight classification is committed to SQLite as each PDF is classified,
+keyed by content hash and classifier version. Later runs reuse that
+classification for unchanged PDFs. If extraction later shows that a PDF routed
+to native needed OCR, the database updates its saved classification to OCR for
+the next run. The startup output and run metrics show
+how many classifications were reused versus computed. Increment
+`CLASSIFIER_VERSION` when changing classifier rules so old cached decisions are
+recomputed. The preflight scans the input list once before worker pools start.
+
+In separate-pool mode, console progress reports an OCR ETA after each OCR-pool
+document finishes. It uses the average elapsed time per completed OCR-pool
+document and the configured OCR worker count to estimate the remaining queue;
+the estimate improves as more documents finish. Run metrics include the OCR
+document total, completed count, average duration, estimated remaining seconds,
+and estimated completion time. These estimates cover PDFs routed to the OCR
+pool, including uncertain classifications.
+
+Separate-pool run metrics sample CPU and worker-process-tree RSS independently
+for the native and OCR pools, including the largest single worker tree. The
+container-wide cgroup measurements remain the authoritative total. Process RSS
+can count shared pages more than once and does not include container page
+cache; GPU measurements remain device-wide.
+
+For a rough memory estimate from a separate-pool run, multiply each pool's
+`max_single_worker_process_tree_rss_bytes` by its worker cap, then compare the
+sum with the container-wide `memory.max_bytes` and leave headroom. This can
+overestimate shared pages and does not predict unusually large PDFs. Pool CPU
+figures show the sampled total cores used by each pool at the configured caps;
+leave headroom for short peaks between samples. Review native-to-OCR mismatch
+warnings before raising the native cap.
+
+Each run creates a resource summary JSON file under `data/run_metrics/` at
+startup, overwrites it every 10 minutes, and writes a final summary at
+shutdown. CPU and memory are sampled every second; NVIDIA GPU telemetry is
+sampled every five seconds when available. The file records the running
+averages and maxima, worker count, document progress, and run duration; it
+stores only the summary, not individual samples. CPU percentages are relative
+to the CPU capacity available to the container. GPU readings are device-wide
+and can include activity from other host processes.
+
+Fusion runs Tesseract first. It runs PaddleOCR on any OCR page whose Tesseract
+quality score is at or below `OCR_FUSION_THRESHOLD` (default `90`), then
+compares their page scores. When one engine scores at least 85 and leads by at
+least 8 points, the fused output uses that engine's full page result. Other
+pages merge detections using page positions, agreement, and support from native
+PDF text. Non-overlapping detections are retained when neither engine clearly
+leads. For conflicting lines, native-text support is used when it clearly
 favors one result; otherwise PaddleOCR is selected and the Tesseract alternative
 is recorded for review in `fusion_assessment` in the JSON. The raw individual
 engine outputs remain untouched. The fused transcript is written under
-`data/output_fused/` by default. Change the threshold with, for example:
+`data/output_fused/` by default. Change the fallback threshold with, for example:
 
 ```sh
 OCR_FUSION_THRESHOLD=85 docker compose run --rm extractor-fused
@@ -84,6 +186,9 @@ OCR_FUSION_THRESHOLD=85 docker compose run --rm extractor-fused
 
 The threshold is part of the fused cache key, so changing it causes an existing
 document to be reevaluated the next time the fused service runs.
+The page-selection algorithm version is also checked for documents that used
+Paddle fallback, so those cached OCR outputs are reevaluated after a fusion
+selection change. Native-only fused outputs remain cached.
 
 The fused `quality_assessment` describes the selected output and notes that
 its confidence values mix engines. `fusion_assessment` records the Tesseract
@@ -196,8 +301,29 @@ Failures are tracked in SQLite and the source PDF is copied under
 `data/failed/`; input PDFs are left untouched. Embedded PDFs are processed
 recursively and get attachment-indexed output paths beneath a directory named
 for their parent PDF. Completed content hashes are reused rather than
-re-extracted, and records left `PROCESSING` after an interruption are retried
-when the processor starts.
+re-extracted. The processor checks the expected output sidecar directly before
+searching other outputs for duplicate content, keeping normal cache hits fast.
+At run start, every discovered PDF is hashed and registered in SQLite; files
+with a valid `COMPLETE` record and current output are excluded from preflight
+classification and worker queues. Changed or stale files are queued again.
+Records left `PROCESSING` after an interruption are retried when the processor
+starts.
+
+## Native text quality review
+
+Scan existing native output sidecars without starting OCR:
+
+```sh
+python -m app.audit_native_text data/output_fused
+```
+
+The audit reports pages with empty or suspicious native text, including long
+text layers with almost no alphabetic characters. The same page-level check is
+used during extraction; flagged pages are sent to OCR, and OCR replaces a
+corrupt native text layer for that page. Each JSON sidecar records the check's
+page counts, alphabetic ratios, and reasons under `native_text_assessment`.
+This is a triage heuristic, so review flagged pages against their PDFs before
+treating the OCR result as authoritative.
 
 The CLI recursively scans nested input folders, prints per-document progress
 and a batch summary, continues after a failed PDF, and exits with a non-zero
@@ -253,8 +379,8 @@ older extraction rules are regenerated automatically.
   package and publishes a Python 3.11 Linux ARM64 wheel. The built image is
   about 1.45 GB before the Tesseract packages are added.
 - The validated host is ARM64 with 20 CPU cores, an NVIDIA GB10, and 121.6 GiB
-  visible RAM. PaddleOCR ran on CPU; the Compose service does not request GPU
-  access. Docling renders at 4 pixels per PDF point (about 288 dpi) for OCR
-  input.
+  visible RAM. PaddleOCR uses the CPU build. The fused Compose service exposes
+  the GPU to `nvidia-smi` for telemetry only; extraction still runs on CPU.
+  Docling renders at 4 pixels per PDF point (about 288 dpi) for OCR input.
 - Compose runs containers as the host UID/GID (default `1000:1000`) so output
   files stay accessible to the local account.

@@ -12,6 +12,8 @@ _SUSPICIOUS = re.compile(
     r"[A-Za-z][~`#$%&+<>;|][A-Za-z]|([A-Za-z])\1\1|"
     r"[A-Z][a-z]+[A-Z][a-z]"
 )
+_PAGE_ENGINE_MIN_SCORE = 85.0
+_PAGE_ENGINE_SCORE_MARGIN = 8.0
 
 
 @dataclass(frozen=True)
@@ -33,7 +35,7 @@ def fuse_ocr_lines(
     """Merge page-local OCR lines and record ambiguous alternatives."""
     result: dict[int, tuple[OCRLine, ...]] = {}
     confidences: dict[int, float] = {}
-    page_details: dict[str, dict[str, int]] = {}
+    page_details: dict[str, dict[str, Any]] = {}
     conflicts: dict[str, list[dict[str, Any]]] = {}
     sources_by_page: dict[str, list[str]] = {}
 
@@ -42,6 +44,70 @@ def fuse_ocr_lines(
         paddle = list(paddle_lines.get(page_number, ()))
         regions = native_regions.get(page_number, [])
         pairs = _match_lines(tess, paddle)
+        preferred_engine, tess_page_score, paddle_page_score = _preferred_page_engine(
+            page_number,
+            tesseract_quality,
+            paddle_quality,
+        )
+        if preferred_engine is not None:
+            preferred_lines = tess if preferred_engine == "tesseract" else paddle
+            selected_engine = (
+                "tesseract" if preferred_engine == "tesseract" else "paddleocr"
+            )
+            result[page_number] = tuple(preferred_lines)
+            sources_by_page[str(page_number)] = [selected_engine] * len(preferred_lines)
+            page_confidence = [
+                line.confidence
+                for line in preferred_lines
+                if line.confidence is not None
+            ]
+            if page_confidence:
+                confidences[page_number] = sum(page_confidence) / len(page_confidence)
+
+            page_conflicts: list[dict[str, Any]] = []
+            agreed_lines = 0
+            for tess_index, paddle_index in pairs:
+                tess_line = tess[tess_index]
+                paddle_line = paddle[paddle_index]
+                if _same_text(tess_line.text, paddle_line.text):
+                    agreed_lines += 1
+                    continue
+                preferred_line = tess_line if preferred_engine == "tesseract" else paddle_line
+                alternate_line = paddle_line if preferred_engine == "tesseract" else tess_line
+                page_conflicts.append(
+                    {
+                        "selected_engine": selected_engine,
+                        "selected_text": preferred_line.text,
+                        "alternate_engine": (
+                            "paddleocr" if preferred_engine == "tesseract" else "tesseract"
+                        ),
+                        "alternate_text": alternate_line.text,
+                        "reason": "higher_page_quality_score",
+                        "tesseract_line_index": tess_index,
+                        "paddle_line_index": paddle_index,
+                        **_bbox_metadata(preferred_line),
+                    }
+                )
+            page_details[str(page_number)] = {
+                "tesseract_line_count": len(tess),
+                "paddle_line_count": len(paddle),
+                "matched_line_count": len(pairs),
+                "conflict_count": len(page_conflicts),
+                "selected_from_tesseract": (
+                    len(preferred_lines) if preferred_engine == "tesseract" else 0
+                ),
+                "selected_from_paddle": (
+                    len(preferred_lines) if preferred_engine == "paddleocr" else 0
+                ),
+                "agreed_between_engines": agreed_lines,
+                "page_selection": f"{selected_engine}_higher_quality",
+                "tesseract_page_quality_score": tess_page_score,
+                "paddle_page_quality_score": paddle_page_score,
+            }
+            if page_conflicts:
+                conflicts[str(page_number)] = page_conflicts
+            continue
+
         matched_tess = {left for left, _ in pairs}
         matched_paddle = {right for _, right in pairs}
         selected: list[tuple[OCRLine, str, int]] = []
@@ -114,21 +180,59 @@ def fuse_ocr_lines(
 
     assessment: dict[str, Any] = {
         "mode": "tesseract_first_paddle_fallback",
+        "fusion_algorithm_version": 2,
         "threshold": threshold,
-        "threshold_comparison": "Tesseract quality score <= threshold",
+        "threshold_comparison": "Tesseract page quality score <= threshold",
         "tesseract_quality_assessment": tesseract_quality,
         "paddle_quality_assessment": paddle_quality,
         "selection_strategy": (
-            "Keep non-overlapping detections from both engines; collapse matched "
-            "lines to one, prefer the line with stronger native-text support, "
-            "otherwise prefer PaddleOCR and record the alternate for review."
+            "When one engine's page quality score is at least "
+            f"{_PAGE_ENGINE_MIN_SCORE:.0f} and leads by at least "
+            f"{_PAGE_ENGINE_SCORE_MARGIN:.0f} points, use that engine's page output. "
+            "Otherwise keep non-overlapping detections from both engines, collapse "
+            "matched lines to one, prefer stronger native-text support, and record "
+            "ambiguous alternatives for review."
         ),
+        "page_quality_selection": {
+            "minimum_score": _PAGE_ENGINE_MIN_SCORE,
+            "minimum_lead": _PAGE_ENGINE_SCORE_MARGIN,
+        },
         "page_counts": page_details,
         "line_sources_by_page": sources_by_page,
     }
     if conflicts:
         assessment["conflicts_by_page"] = conflicts
     return FusedOCR(result, confidences, assessment)
+
+
+def _preferred_page_engine(
+    page_number: int,
+    tesseract_quality: dict[str, Any],
+    paddle_quality: dict[str, Any],
+) -> tuple[str | None, float | None, float | None]:
+    tess_score = _page_quality_score(tesseract_quality, page_number)
+    paddle_score = _page_quality_score(paddle_quality, page_number)
+    if (
+        paddle_score is not None
+        and paddle_score >= _PAGE_ENGINE_MIN_SCORE
+        and (tess_score is None or paddle_score - tess_score >= _PAGE_ENGINE_SCORE_MARGIN)
+    ):
+        return "paddleocr", tess_score, paddle_score
+    if (
+        tess_score is not None
+        and tess_score >= _PAGE_ENGINE_MIN_SCORE
+        and (paddle_score is None or tess_score - paddle_score >= _PAGE_ENGINE_SCORE_MARGIN)
+    ):
+        return "tesseract", tess_score, paddle_score
+    return None, tess_score, paddle_score
+
+
+def _page_quality_score(assessment: dict[str, Any], page_number: int) -> float | None:
+    page = (assessment.get("pages") or {}).get(str(page_number))
+    if not isinstance(page, dict):
+        return None
+    score = page.get("score")
+    return float(score) if isinstance(score, (int, float)) else None
 
 
 def _match_lines(

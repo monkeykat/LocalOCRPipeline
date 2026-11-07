@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import shutil
 import sqlite3
 import tempfile
@@ -33,8 +34,10 @@ from app.paths import (
 )
 from app.postprocessor import clean_transcript, review_flags_by_page
 from app.quality import assess_extraction_quality
+from app.text_quality import assess_native_text
 
 _EXTRACTION_PIPELINE_VERSION = 10
+_FUSION_ALGORITHM_VERSION = 2
 
 
 class Extractor(Protocol):
@@ -62,6 +65,8 @@ class DocumentProcessor:
         self,
         paths: ProjectPaths | None = None,
         extractor: Extractor | None = None,
+        *,
+        reset_interrupted: bool = True,
     ) -> None:
         self.paths = paths or get_project_paths()
         self.extractor = extractor or PdfExtractor()
@@ -80,10 +85,11 @@ class DocumentProcessor:
             else None
         )
         self.post_cleanup_enabled = _read_bool_env("OCR_POST_CLEANUP", default=True)
-        initialize_database(self.paths)
         ensure_data_directories(self.paths)
-        with connect_database(self.paths.database_path) as connection:
-            reset_interrupted_documents(connection)
+        if reset_interrupted:
+            initialize_database(self.paths)
+            with connect_database(self.paths.database_path) as connection:
+                reset_interrupted_documents(connection)
 
     def process_document(self, source_path: Path) -> ProcessedDocument:
         source = source_path.resolve()
@@ -102,6 +108,47 @@ class DocumentProcessor:
             parent_context=None,
             ancestor_hashes=frozenset(),
         )
+
+    def record_worker_failure(
+        self,
+        source_path: Path,
+        error_message: str,
+        *,
+        file_hash: str | None = None,
+    ) -> bool:
+        """Persist a terminal worker failure after bounded retries."""
+        source = source_path.resolve()
+        relative_path = source.relative_to(self.paths.input_dir.resolve())
+        content_hash = file_hash or _hash_content(source)
+        database_path = str(source)
+        with connect_database(self.paths.database_path) as connection:
+            row = connection.execute(
+                """
+                SELECT id, status FROM documents
+                WHERE file_path = ? AND file_hash = ?
+                """,
+                (database_path, content_hash),
+            ).fetchone()
+            if row is None:
+                document_id = register_document(
+                    connection,
+                    filename=source.name,
+                    file_path=database_path,
+                    file_hash=content_hash,
+                )
+            else:
+                if row["status"] == DocumentStatus.COMPLETE.value:
+                    return False
+                document_id = int(row["id"])
+
+        self._remove_output_artifacts(relative_path)
+        self._fail_document(
+            document_id,
+            error_message,
+            source,
+            failed_path_for(source, self.paths),
+        )
+        return True
 
     def _process_content(
         self,
@@ -165,12 +212,15 @@ class DocumentProcessor:
             )
 
         if cached_document is not None:
-            cached_output = self._find_cached_output(file_hash)
+            output_path = self._output_path(output_relative_path)
+            metadata_path = output_path.with_suffix(".json")
+            cached_output = self._find_cached_output(
+                file_hash,
+                preferred_metadata_path=metadata_path,
+            )
             if cached_output is None:
                 cached_document = None
             else:
-                output_path = self._output_path(output_relative_path)
-                metadata_path = output_path.with_suffix(".json")
                 try:
                     self._publish_cached_output(
                         cached_output=cached_output,
@@ -337,6 +387,8 @@ class DocumentProcessor:
             extraction.quality_assessment
             or assess_extraction_quality(extraction, review_flags)
         )
+        if extraction.native_text_assessment is not None:
+            metadata["native_text_assessment"] = extraction.native_text_assessment
         if extraction.fusion_assessment is not None:
             metadata["fusion_assessment"] = extraction.fusion_assessment
         if self.post_cleanup_enabled:
@@ -433,33 +485,73 @@ class DocumentProcessor:
     def _find_cached_output(
         self,
         file_hash: str,
+        *,
+        preferred_metadata_path: Path | None = None,
     ) -> dict[str, object] | None:
+        if preferred_metadata_path is not None:
+            cached_output = self._read_cached_output(
+                preferred_metadata_path,
+                file_hash,
+            )
+            if cached_output is not None:
+                return cached_output
+
         for metadata_path in self.paths.output_dir.rglob("*.json"):
-            try:
-                metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
-            except (OSError, json.JSONDecodeError):
+            if metadata_path == preferred_metadata_path:
                 continue
-            if not isinstance(metadata, dict) or metadata.get("file_hash") != file_hash:
-                continue
-            if metadata.get("pipeline_version") != _EXTRACTION_PIPELINE_VERSION:
-                continue
-            if metadata.get("ocr_engine", "paddleocr") != self.ocr_engine:
-                continue
-            if self.ocr_engine == "fused":
-                fusion_assessment = metadata.get("fusion_assessment")
-                if not isinstance(fusion_assessment, dict):
-                    continue
-                try:
-                    cached_threshold = float(fusion_assessment["threshold"])
-                except (KeyError, TypeError, ValueError):
-                    continue
-                if cached_threshold != self.fusion_threshold:
-                    continue
-            text_path = metadata_path.with_suffix(".txt")
-            if not text_path.is_file():
-                continue
-            return {"metadata": metadata, "text_path": text_path}
+            cached_output = self._read_cached_output(metadata_path, file_hash)
+            if cached_output is not None:
+                return cached_output
         return None
+
+    def has_reusable_output(
+        self,
+        file_hash: str,
+        metadata_path: Path,
+    ) -> bool:
+        """Return whether this path has a valid output for the active settings."""
+        return self._read_cached_output(metadata_path, file_hash) is not None
+
+    def _read_cached_output(
+        self,
+        metadata_path: Path,
+        file_hash: str,
+    ) -> dict[str, object] | None:
+        try:
+            metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            return None
+        if not isinstance(metadata, dict) or metadata.get("file_hash") != file_hash:
+            return None
+        if metadata.get("pipeline_version") != _EXTRACTION_PIPELINE_VERSION:
+            return None
+        if metadata.get("ocr_engine", "paddleocr") != self.ocr_engine:
+            return None
+        if self.ocr_engine == "fused":
+            fusion_assessment = metadata.get("fusion_assessment")
+            if not isinstance(fusion_assessment, dict):
+                return None
+            try:
+                cached_threshold = float(fusion_assessment["threshold"])
+            except (KeyError, TypeError, ValueError):
+                return None
+            if cached_threshold != self.fusion_threshold:
+                return None
+            if (
+                fusion_assessment.get("paddle_fallback_triggered") is True
+                and fusion_assessment.get("fusion_algorithm_version")
+                != _FUSION_ALGORITHM_VERSION
+            ):
+                return None
+        text_path = metadata_path.with_suffix(".txt")
+        if not text_path.is_file():
+            return None
+        if (
+            metadata.get("extraction_method") == ExtractionMethod.NATIVE.value
+            and _cached_native_text_needs_ocr(text_path)
+        ):
+            return None
+        return {"metadata": metadata, "text_path": text_path}
 
     def _publish_cached_output(
         self,
@@ -497,6 +589,7 @@ class DocumentProcessor:
             "ocr_confidence_by_page",
             "ocr_lines_by_page",
             "native_text_regions_by_page",
+            "native_text_assessment",
             "quality_assessment",
             "fusion_assessment",
         ):
@@ -582,6 +675,22 @@ def _hash_content(source: Path | bytes) -> str:
             for chunk in iter(lambda: file.read(1024 * 1024), b""):
                 digest.update(chunk)
     return digest.hexdigest()
+
+
+def _cached_native_text_needs_ocr(text_path: Path) -> bool:
+    try:
+        text = text_path.read_text(encoding="utf-8")
+    except OSError:
+        return False
+    _, separator, body = text.partition("\n\n")
+    if not separator:
+        body = text
+    pages = re.split(r"(?m)^=== PAGE \d+ ===\s*$", body)
+    return any(
+        "very_low_alphabetic_ratio" in assess_native_text(page)["reasons"]
+        for page in pages
+        if page.strip()
+    )
 
 
 def _cleaned_output_path(output_path: Path) -> Path:
